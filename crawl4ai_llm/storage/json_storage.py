@@ -12,7 +12,7 @@ import logging
 import uuid
 import re
 from pathlib import Path
-from typing import Dict, List, Any, Optional, Tuple, Set
+from typing import Dict, List, Any, Optional, Tuple, Set, Sequence
 from datetime import datetime
 import aiofiles
 import aiofiles.os
@@ -176,6 +176,33 @@ class JSONStorage(BaseStorage):
             logger.error(f"Error saving index: {str(e)}")
             raise StorageConnectionError(f"Error saving index: {str(e)}")
     
+    def _create_index_entry(self, product_id: str, product_data: ProductData) -> Dict[str, Any]:
+        """
+        Create an index entry for a product.
+        
+        Args:
+            product_id: Product ID
+            product_data: Product data
+            
+        Returns:
+            Dictionary containing index entry
+        """
+        return {
+            "id": product_id,
+            "url": str(product_data.url),
+            "title": product_data.title,
+            "brand": product_data.brand,
+            "available": product_data.available,
+            "extracted_at": product_data.extracted_at.isoformat() 
+                if product_data.extracted_at else None,
+            "identifiers": product_data.identifiers,
+            # Add price info to index for sorting/filtering
+            "price_info": [{
+                "amount": p.amount,
+                "currency": p.currency
+            } for p in product_data.prices] if product_data.prices else []
+        }
+    
     async def save_product(self, product_data: ProductData) -> str:
         """
         Save product data to a JSON file.
@@ -203,21 +230,7 @@ class JSONStorage(BaseStorage):
             index = await self._load_index()
             
             # Add basic metadata to the index for searching
-            index_entry: Dict[str, Any] = {
-                "id": product_id,
-                "url": str(product_data.url),
-                "title": product_data.title,
-                "brand": product_data.brand,
-                "available": product_data.available,
-                "extracted_at": product_data.extracted_at.isoformat() 
-                    if product_data.extracted_at else None,
-                "identifiers": product_data.identifiers,
-                # Add price info to index for sorting/filtering
-                "price_info": [{
-                    "amount": p.amount,
-                    "currency": p.currency
-                } for p in product_data.prices] if product_data.prices else []
-            }
+            index_entry = self._create_index_entry(product_id, product_data)
             
             # Update the index
             index[product_id] = index_entry
@@ -233,6 +246,58 @@ class JSONStorage(BaseStorage):
         except (PermissionError, OSError) as e:
             logger.error(f"Error saving product: {str(e)}")
             raise StorageConnectionError(f"Error saving product: {str(e)}")
+    
+    async def save_products(self, products: Sequence[ProductData]) -> List[str]:
+        """
+        Save multiple products in a single batch operation.
+        
+        This optimized implementation reduces the number of index file operations
+        by updating the index once for all products.
+        
+        Args:
+            products: Sequence of ProductData objects
+            
+        Returns:
+            List of product IDs for successfully saved products
+        """
+        if not products:
+            return []
+        
+        product_ids = []
+        index = await self._load_index()
+        index_updated = False
+        
+        for product in products:
+            try:
+                # Generate product ID
+                product_id = self._get_product_id(product)
+                file_path = self._get_file_path(product_id)
+                
+                # Check if product already exists
+                if file_path.exists():
+                    logger.warning(f"Product with ID {product_id} already exists, skipping")
+                    continue
+                
+                # Add to index
+                index_entry = self._create_index_entry(product_id, product)
+                index[product_id] = index_entry
+                index_updated = True
+                
+                # Save product file
+                async with self._get_lock(file_path):
+                    async with aiofiles.open(file_path, "w") as f:
+                        await f.write(product.model_dump_json(indent=2))
+                
+                product_ids.append(product_id)
+                
+            except Exception as e:
+                logger.error(f"Error saving product: {str(e)}")
+        
+        # Save index once if any products were added
+        if index_updated:
+            await self._save_index(index)
+        
+        return product_ids
     
     async def get_product(self, product_id: str) -> ProductData:
         """
@@ -264,6 +329,34 @@ class JSONStorage(BaseStorage):
         except Exception as e:
             logger.error(f"Error reading product: {str(e)}")
             raise StorageError(f"Error reading product: {str(e)}")
+    
+    async def get_products(self, product_ids: Sequence[str]) -> List[ProductData]:
+        """
+        Retrieve multiple products by ID.
+        
+        This implementation uses asyncio.gather to load products concurrently.
+        
+        Args:
+            product_ids: Sequence of product IDs
+            
+        Returns:
+            List of ProductData objects for found products
+        """
+        if not product_ids:
+            return []
+        
+        async def get_product_safe(pid: str) -> Optional[ProductData]:
+            try:
+                return await self.get_product(pid)
+            except (ProductNotFoundError, StorageError) as e:
+                logger.warning(f"Error loading product {pid}: {str(e)}")
+                return None
+        
+        # Load products concurrently
+        results = await asyncio.gather(*[get_product_safe(pid) for pid in product_ids])
+        
+        # Filter out None results (failed loads)
+        return [p for p in results if p is not None]
     
     async def update_product(self, product_id: str, product_data: ProductData) -> bool:
         """
@@ -315,6 +408,69 @@ class JSONStorage(BaseStorage):
             logger.error(f"Error updating product: {str(e)}")
             raise StorageConnectionError(f"Error updating product: {str(e)}")
     
+    async def update_products(self, products: Dict[str, ProductData]) -> Dict[str, bool]:
+        """
+        Update multiple products in a single batch operation.
+        
+        This optimized implementation reduces the number of index file operations
+        by updating the index once for all products.
+        
+        Args:
+            products: Dictionary mapping product IDs to updated ProductData objects
+            
+        Returns:
+            Dictionary mapping product IDs to update success (True/False)
+        """
+        if not products:
+            return {}
+        
+        results = {}
+        index = await self._load_index()
+        index_updated = False
+        
+        for product_id, product_data in products.items():
+            try:
+                file_path = self._get_file_path(product_id)
+                
+                if not file_path.exists():
+                    logger.warning(f"Product with ID {product_id} not found, skipping")
+                    results[product_id] = False
+                    continue
+                
+                # Update product file
+                async with self._get_lock(file_path):
+                    async with aiofiles.open(file_path, "w") as f:
+                        await f.write(product_data.model_dump_json(indent=2))
+                
+                # Update index
+                if product_id in index:
+                    index[product_id].update({
+                        "url": str(product_data.url),
+                        "title": product_data.title,
+                        "brand": product_data.brand,
+                        "available": product_data.available,
+                        "extracted_at": product_data.extracted_at.isoformat() 
+                            if product_data.extracted_at else None,
+                        "identifiers": product_data.identifiers,
+                        "price_info": [{
+                            "amount": p.amount,
+                            "currency": p.currency
+                        } for p in product_data.prices] if product_data.prices else []
+                    })
+                    index_updated = True
+                
+                results[product_id] = True
+                
+            except Exception as e:
+                logger.error(f"Error updating product {product_id}: {str(e)}")
+                results[product_id] = False
+        
+        # Save index once if any products were updated
+        if index_updated:
+            await self._save_index(index)
+        
+        return results
+    
     async def delete_product(self, product_id: str) -> bool:
         """
         Delete a product from storage.
@@ -355,6 +511,61 @@ class JSONStorage(BaseStorage):
         except (PermissionError, OSError) as e:
             logger.error(f"Error deleting product: {str(e)}")
             raise StorageConnectionError(f"Error deleting product: {str(e)}")
+    
+    async def delete_products(self, product_ids: Sequence[str]) -> Dict[str, bool]:
+        """
+        Delete multiple products in a single batch operation.
+        
+        This optimized implementation reduces the number of index file operations
+        by updating the index once for all products.
+        
+        Args:
+            product_ids: Sequence of product IDs to delete
+            
+        Returns:
+            Dictionary mapping product IDs to deletion success (True/False)
+        """
+        if not product_ids:
+            return {}
+        
+        results = {}
+        index = await self._load_index()
+        index_updated = False
+        
+        for product_id in product_ids:
+            try:
+                file_path = self._get_file_path(product_id)
+                
+                if not file_path.exists():
+                    logger.warning(f"Product with ID {product_id} not found, skipping")
+                    results[product_id] = False
+                    continue
+                
+                # Delete product file
+                async with self._get_lock(file_path):
+                    await aiofiles.os.remove(file_path)
+                
+                # Update index
+                if product_id in index:
+                    del index[product_id]
+                    index_updated = True
+                
+                # Remove lock
+                path_str = str(file_path)
+                if path_str in self.locks:
+                    del self.locks[path_str]
+                
+                results[product_id] = True
+                
+            except Exception as e:
+                logger.error(f"Error deleting product {product_id}: {str(e)}")
+                results[product_id] = False
+        
+        # Save index once if any products were deleted
+        if index_updated:
+            await self._save_index(index)
+        
+        return results
     
     async def list_products(self, 
                          filters: Optional[Dict[str, Any]] = None, 
@@ -428,14 +639,8 @@ class JSONStorage(BaseStorage):
             total_count = len(product_ids)
             paginated_ids = product_ids[offset:offset + limit]
             
-            # Load product data
-            products = []
-            for pid in paginated_ids:
-                try:
-                    product = await self.get_product(pid)
-                    products.append(product)
-                except (ProductNotFoundError, StorageError) as e:
-                    logger.warning(f"Error loading product {pid}: {str(e)}")
+            # Load product data using batch method
+            products = await self.get_products(paginated_ids)
             
             return products, total_count
             
