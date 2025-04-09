@@ -1,12 +1,12 @@
 """
 Factory for creating storage instances.
 
-This module provides a factory function for creating storage instances
-based on configuration.
+This module provides a factory function for creating storage instances based on
+the storage configuration. Supported storage types include JSON file storage.
 """
 
 import logging
-from typing import Dict, Type, Optional
+from typing import Optional, Dict, Any
 
 from ..config import StorageConfig
 from .base import BaseStorage
@@ -15,7 +15,7 @@ from .json_storage import JSONStorage
 logger = logging.getLogger(__name__)
 
 # Registry of available storage implementations
-STORAGE_REGISTRY: Dict[str, Type[BaseStorage]] = {
+STORAGE_REGISTRY = {
     "json": JSONStorage,
 }
 
@@ -23,28 +23,41 @@ STORAGE_REGISTRY: Dict[str, Type[BaseStorage]] = {
 _storage_instance: Optional[BaseStorage] = None
 
 
-def get_storage(config: StorageConfig) -> BaseStorage:
+async def get_storage(config: StorageConfig) -> BaseStorage:
     """
-    Get or create a storage instance based on configuration.
+    Get or create a storage instance based on the configuration.
     
     Args:
-        config: Storage configuration
+        config: Storage configuration.
         
     Returns:
-        Storage instance
+        BaseStorage: A storage instance.
         
     Raises:
-        ValueError: If the storage type is unknown
+        ValueError: If the storage type is unknown.
     """
     global _storage_instance
     
-    if _storage_instance is None:
-        storage_class = STORAGE_REGISTRY.get(config.type.lower())
-        
-        if storage_class is None:
-            raise ValueError(f"Unknown storage type: {config.type}")
-        
-        logger.info(f"Initializing {config.type} storage at {config.path}")
-        _storage_instance = storage_class(config)
+    # Return the singleton instance if it already exists
+    if _storage_instance is not None:
+        return _storage_instance
+    
+    # Get the storage implementation class
+    storage_type = config.type.lower()
+    if storage_type not in STORAGE_REGISTRY:
+        raise ValueError(f"Unknown storage type: {storage_type}")
+    
+    storage_class = STORAGE_REGISTRY[storage_type]
+    
+    # Extract the configuration parameters
+    params: Dict[str, Any] = {}
+    if storage_type == "json":
+        params["directory"] = config.json_directory
+        if config.lock_timeout:
+            params["lock_timeout"] = config.lock_timeout
+    
+    # Create the storage instance
+    logger.info(f"Initializing {storage_type} storage")
+    _storage_instance = storage_class(**params)
     
     return _storage_instance
