@@ -1,28 +1,24 @@
 """
 JSON file-based storage implementation.
 
-This module provides a storage implementation that uses JSON files
-to store product data on the filesystem.
+This module provides a storage implementation that uses JSON files to store
+and retrieve product data, with an index file for efficient lookups.
 """
 
-import os
-import json
 import asyncio
+import json
+import os
+import hashlib
 import logging
-import uuid
-import re
-from pathlib import Path
-from typing import Dict, List, Any, Optional, Tuple, Set, Sequence
 from datetime import datetime
+from typing import Dict, List, Any, Optional, Tuple, Union, Set
 import aiofiles
 import aiofiles.os
 from filelock import FileLock
 
-from ..config import StorageConfig
 from ..models import ProductData
 from .base import (
     BaseStorage,
-    StorageError,
     ProductNotFoundError,
     DuplicateProductError,
     StorageConnectionError
@@ -33,132 +29,115 @@ logger = logging.getLogger(__name__)
 
 class JSONStorage(BaseStorage):
     """
-    Storage implementation using JSON files.
+    A storage implementation that uses JSON files to store product data.
     
-    This class provides a storage implementation that uses JSON files to store
-    product data on the filesystem. It maintains an index file for quick lookups
-    and efficient filtering.
+    This implementation stores each product in a separate JSON file and 
+    maintains an index file for efficient lookups, including batch operations.
+    
+    The index file keeps track of product IDs, URLs, and other metadata for
+    filtering and sorting operations.
     
     Attributes:
-        config: Storage configuration
-        storage_path: Path to the storage directory
-        index_path: Path to the index file
-        locks: Dictionary of file locks
+        directory: Path to the directory for storing the JSON files.
+        lock_timeout: Timeout for file lock in seconds.
     """
     
-    def __init__(self, config: StorageConfig):
+    def __init__(self, directory: str, lock_timeout: int = 30):
         """
-        Initialize JSON storage.
+        Initialize the JSON storage.
         
         Args:
-            config: Storage configuration
+            directory: Path to the directory for storing JSON files.
+            lock_timeout: Timeout for file lock in seconds.
             
         Raises:
-            StorageConnectionError: If there's an issue creating/accessing the storage directory
+            StorageConnectionError: If the directory doesn't exist or is not writable.
         """
-        self.config = config
-        self.storage_path = Path(config.path)
-        self.index_path = self.storage_path / "index.json"
-        self.locks: Dict[str, FileLock] = {}
+        self.directory = directory
+        self.lock_timeout = lock_timeout
+        self.index_path = os.path.join(directory, "index.json")
+        self.lock_path = os.path.join(directory, "index.lock")
         
+        # Create the directory if it doesn't exist
         try:
-            # Create storage directory if it doesn't exist and create_if_missing is True
-            if config.create_if_missing and not self.storage_path.exists():
-                self.storage_path.mkdir(parents=True, exist_ok=True)
-                
-            # Check if storage directory is writable
-            if not os.access(self.storage_path, os.W_OK):
-                raise StorageConnectionError(
-                    f"Storage directory {self.storage_path} is not writable"
-                )
+            os.makedirs(directory, exist_ok=True)
+            
+            # Test if we can write to the directory
+            test_file = os.path.join(directory, ".test_write")
+            with open(test_file, "w") as f:
+                f.write("")
+            os.remove(test_file)
+            
         except (PermissionError, OSError) as e:
-            raise StorageConnectionError(f"Error accessing storage directory: {str(e)}")
+            raise StorageConnectionError(f"Cannot access storage directory: {e}")
     
-    def _get_product_id(self, product_data: ProductData) -> str:
+    async def _get_product_id(self, product: ProductData) -> str:
         """
-        Generate a product ID based on product data.
-        
-        If use_uuid is True, generates a UUID. Otherwise, tries to create an ID
-        from product attributes like URL, title, and brand.
+        Generate a product ID based on its attributes.
         
         Args:
-            product_data: Product data
+            product: The product data.
             
         Returns:
-            Product ID string
+            str: The generated product ID.
         """
-        if self.config.use_uuid:
-            return str(uuid.uuid4())
+        # Use the product's ID if it already has one
+        if product.id:
+            return product.id
         
-        # Try to create a deterministic ID based on product attributes
-        if product_data.identifiers:
-            # Use an identifier (SKU, UPC, etc.) if available
-            for id_type in ["sku", "upc", "ean", "isbn", "mpn", "gtin"]:
-                if id_type in product_data.identifiers:
-                    return f"{id_type}_{product_data.identifiers[id_type]}"
+        # Otherwise, generate an ID based on the product URL
+        if product.url:
+            return hashlib.md5(product.url.encode()).hexdigest()
         
-        # Fallback to URL-based ID
-        url_path = str(product_data.url).split("/")[-1]
-        if "?" in url_path:
-            url_path = url_path.split("?")[0]
+        # If neither ID nor URL is available, use a combination of title, brand, and SKU
+        id_components = []
+        if product.title:
+            id_components.append(product.title)
+        if product.brand:
+            id_components.append(product.brand)
+        if product.identifiers:
+            for key, value in product.identifiers.items():
+                id_components.append(f"{key}:{value}")
         
-        if url_path and not url_path.isspace():
-            return re.sub(r'[^\w\-_]', '_', url_path.lower())
+        if id_components:
+            id_string = "_".join(id_components)
+            return hashlib.md5(id_string.encode()).hexdigest()
         
-        # Last resort: hash of URL and title
-        hash_input = f"{product_data.url}_{product_data.title}"
-        return str(abs(hash(hash_input)) % 100000000)
+        # Last resort: timestamp + part of the product's hash
+        timestamp = datetime.now().isoformat()
+        product_hash = hash(product.json())
+        return hashlib.md5(f"{timestamp}_{product_hash}".encode()).hexdigest()
     
-    def _get_file_path(self, product_id: str) -> Path:
+    def _get_file_path(self, product_id: str) -> str:
         """
-        Get the file path for a product ID.
+        Get the file path for a product.
         
         Args:
-            product_id: Product ID
+            product_id: The ID of the product.
             
         Returns:
-            Path object for the product file
+            str: The file path.
         """
-        # Sanitize product ID to create a safe filename
-        safe_id = re.sub(r'[^\w\-_]', '_', product_id)
-        return self.storage_path / f"{safe_id}.json"
-    
-    def _get_lock(self, file_path: Path) -> FileLock:
-        """
-        Get or create a file lock for the specified path.
-        
-        Args:
-            file_path: Path to lock
-            
-        Returns:
-            FileLock object
-        """
-        path_str = str(file_path)
-        if path_str not in self.locks:
-            self.locks[path_str] = FileLock(f"{path_str}.lock", timeout=self.config.lock_timeout)
-        
-        return self.locks[path_str]
+        return os.path.join(self.directory, f"{product_id}.json")
     
     async def _load_index(self) -> Dict[str, Dict[str, Any]]:
         """
         Load the index file.
         
         Returns:
-            Dictionary mapping product IDs to index entries
+            Dict[str, Dict[str, Any]]: The index data.
+            
+        Raises:
+            StorageConnectionError: If there's an error loading the index.
         """
-        if not self.index_path.exists():
-            return {}
-        
         try:
-            async with self._get_lock(self.index_path):
+            if await aiofiles.os.path.exists(self.index_path):
                 async with aiofiles.open(self.index_path, "r") as f:
                     content = await f.read()
                     return json.loads(content) if content else {}
-        except (json.JSONDecodeError, FileNotFoundError):
-            logger.warning(f"Index file {self.index_path} is corrupted or missing, creating a new one")
             return {}
-        except Exception as e:
-            logger.error(f"Error loading index: {str(e)}")
+        except (json.JSONDecodeError, PermissionError, OSError) as e:
+            logger.error(f"Error loading index: {e}")
             return {}
     
     async def _save_index(self, index: Dict[str, Dict[str, Any]]) -> None:
@@ -166,260 +145,321 @@ class JSONStorage(BaseStorage):
         Save the index file.
         
         Args:
-            index: Dictionary mapping product IDs to index entries
-        """
-        try:
-            async with self._get_lock(self.index_path):
-                async with aiofiles.open(self.index_path, "w") as f:
-                    await f.write(json.dumps(index, indent=2))
-        except (PermissionError, OSError) as e:
-            logger.error(f"Error saving index: {str(e)}")
-            raise StorageConnectionError(f"Error saving index: {str(e)}")
-    
-    def _create_index_entry(self, product_id: str, product_data: ProductData) -> Dict[str, Any]:
-        """
-        Create an index entry for a product.
-        
-        Args:
-            product_id: Product ID
-            product_data: Product data
-            
-        Returns:
-            Dictionary containing index entry
-        """
-        return {
-            "id": product_id,
-            "url": str(product_data.url),
-            "title": product_data.title,
-            "brand": product_data.brand,
-            "available": product_data.available,
-            "extracted_at": product_data.extracted_at.isoformat() 
-                if product_data.extracted_at else None,
-            "identifiers": product_data.identifiers,
-            # Add price info to index for sorting/filtering
-            "price_info": [{
-                "amount": p.amount,
-                "currency": p.currency
-            } for p in product_data.prices] if product_data.prices else []
-        }
-    
-    async def save_product(self, product_data: ProductData) -> str:
-        """
-        Save product data to a JSON file.
-        
-        Args:
-            product_data: Product data to save
-            
-        Returns:
-            Product ID
+            index: The index data to save.
             
         Raises:
-            DuplicateProductError: If the product already exists
-            StorageConnectionError: If there's an issue saving the product
+            StorageConnectionError: If there's an error saving the index.
         """
-        # Generate product ID
-        product_id = self._get_product_id(product_data)
-        file_path = self._get_file_path(product_id)
-        
-        # Check if product already exists
-        if file_path.exists():
-            raise DuplicateProductError(f"Product with ID {product_id} already exists")
-        
         try:
-            # Create index entry
-            index = await self._load_index()
-            
-            # Add basic metadata to the index for searching
-            index_entry = self._create_index_entry(product_id, product_data)
-            
-            # Update the index
-            index[product_id] = index_entry
-            await self._save_index(index)
-            
-            # Save the product data
-            async with self._get_lock(file_path):
-                async with aiofiles.open(file_path, "w") as f:
-                    await f.write(product_data.model_dump_json(indent=2))
-            
-            return product_id
-            
-        except (PermissionError, OSError) as e:
-            logger.error(f"Error saving product: {str(e)}")
-            raise StorageConnectionError(f"Error saving product: {str(e)}")
+            lock = FileLock(self.lock_path, timeout=self.lock_timeout)
+            with lock:
+                async with aiofiles.open(self.index_path, "w") as f:
+                    await f.write(json.dumps(index, indent=2))
+        except (PermissionError, OSError, json.JSONDecodeError) as e:
+            logger.error(f"Error saving index: {e}")
+            raise StorageConnectionError(f"Cannot save index: {e}")
     
-    async def save_products(self, products: Sequence[ProductData]) -> List[str]:
+    async def save_product(self, product: ProductData) -> str:
         """
-        Save multiple products in a single batch operation.
-        
-        This optimized implementation reduces the number of index file operations
-        by updating the index once for all products.
+        Save a single product to storage.
         
         Args:
-            products: Sequence of ProductData objects
+            product: The product data to save.
             
         Returns:
-            List of product IDs for successfully saved products
+            str: The ID of the saved product.
+            
+        Raises:
+            DuplicateProductError: If the product already exists.
+            StorageConnectionError: If there's an error connecting to storage.
+        """
+        # Generate or use the product ID
+        product_id = await self._get_product_id(product)
+        file_path = self._get_file_path(product_id)
+        
+        # Check if the product already exists
+        if await aiofiles.os.path.exists(file_path):
+            raise DuplicateProductError(f"Product with ID {product_id} already exists")
+        
+        # Set the product ID
+        product_dict = product.dict()
+        product_dict["id"] = product_id
+        product = ProductData(**product_dict)
+        
+        # Save the product file
+        try:
+            async with aiofiles.open(file_path, "w") as f:
+                await f.write(product.json(indent=2))
+        except (PermissionError, OSError) as e:
+            logger.error(f"Error saving product {product_id}: {e}")
+            raise StorageConnectionError(f"Cannot save product: {e}")
+        
+        # Update the index
+        try:
+            lock = FileLock(self.lock_path, timeout=self.lock_timeout)
+            with lock:
+                index = await self._load_index()
+                
+                # Create index entry with metadata for efficient filtering
+                index[product_id] = {
+                    "id": product_id,
+                    "url": product.url,
+                    "title": product.title,
+                    "brand": product.brand,
+                    "price": product.price.amount if product.price else None,
+                    "currency": product.price.currency if product.price else None,
+                    "identifiers": product.identifiers,
+                    "created_at": datetime.now().isoformat(),
+                    "updated_at": datetime.now().isoformat()
+                }
+                
+                await self._save_index(index)
+        except Exception as e:
+            # If index update fails, remove the product file
+            logger.error(f"Error updating index for product {product_id}: {e}")
+            try:
+                await aiofiles.os.remove(file_path)
+            except Exception:
+                pass
+            raise StorageConnectionError(f"Cannot update index: {e}")
+        
+        return product_id
+    
+    async def save_products(self, products: List[ProductData]) -> List[str]:
+        """
+        Save multiple products to storage in batch.
+        
+        Args:
+            products: List of product data to save.
+            
+        Returns:
+            List[str]: The IDs of the saved products.
+            
+        Raises:
+            DuplicateProductError: If any product already exists.
+            StorageConnectionError: If there's an error connecting to storage.
         """
         if not products:
             return []
         
         product_ids = []
+        saved_files = []
         index = await self._load_index()
         index_updated = False
         
-        for product in products:
-            try:
-                # Generate product ID
-                product_id = self._get_product_id(product)
+        try:
+            # Process each product
+            for product in products:
+                product_id = await self._get_product_id(product)
                 file_path = self._get_file_path(product_id)
                 
-                # Check if product already exists
-                if file_path.exists():
-                    logger.warning(f"Product with ID {product_id} already exists, skipping")
-                    continue
+                # Check if the product already exists
+                if await aiofiles.os.path.exists(file_path):
+                    # Clean up any files we've created
+                    for path in saved_files:
+                        try:
+                            await aiofiles.os.remove(path)
+                        except Exception:
+                            pass
+                    raise DuplicateProductError(f"Product with ID {product_id} already exists")
                 
-                # Add to index
-                index_entry = self._create_index_entry(product_id, product)
-                index[product_id] = index_entry
-                index_updated = True
+                # Set the product ID
+                product_dict = product.dict()
+                product_dict["id"] = product_id
+                product = ProductData(**product_dict)
                 
-                # Save product file
-                async with self._get_lock(file_path):
-                    async with aiofiles.open(file_path, "w") as f:
-                        await f.write(product.model_dump_json(indent=2))
+                # Save the product file
+                async with aiofiles.open(file_path, "w") as f:
+                    await f.write(product.json(indent=2))
                 
+                saved_files.append(file_path)
                 product_ids.append(product_id)
                 
-            except Exception as e:
-                logger.error(f"Error saving product: {str(e)}")
+                # Update index entry
+                now = datetime.now().isoformat()
+                index[product_id] = {
+                    "id": product_id,
+                    "url": product.url,
+                    "title": product.title,
+                    "brand": product.brand,
+                    "price": product.price.amount if product.price else None,
+                    "currency": product.price.currency if product.price else None,
+                    "identifiers": product.identifiers,
+                    "created_at": now,
+                    "updated_at": now
+                }
+                index_updated = True
+            
+            # Save the updated index
+            if index_updated:
+                lock = FileLock(self.lock_path, timeout=self.lock_timeout)
+                with lock:
+                    await self._save_index(index)
+            
+            return product_ids
         
-        # Save index once if any products were added
-        if index_updated:
-            await self._save_index(index)
-        
-        return product_ids
+        except (PermissionError, OSError) as e:
+            # Clean up any files we've created
+            for path in saved_files:
+                try:
+                    await aiofiles.os.remove(path)
+                except Exception:
+                    pass
+            
+            logger.error(f"Error saving products: {e}")
+            raise StorageConnectionError(f"Cannot save products: {e}")
     
     async def get_product(self, product_id: str) -> ProductData:
         """
-        Retrieve product data by ID.
+        Retrieve a product by ID.
         
         Args:
-            product_id: Product ID
+            product_id: The ID of the product to retrieve.
             
         Returns:
-            Product data
+            ProductData: The product data.
             
         Raises:
-            ProductNotFoundError: If the product is not found
-            StorageError: If there's an issue reading the product
+            ProductNotFoundError: If the product doesn't exist.
+            StorageConnectionError: If there's an error connecting to storage.
         """
         file_path = self._get_file_path(product_id)
         
-        if not file_path.exists():
-            raise ProductNotFoundError(f"Product with ID {product_id} not found")
-        
         try:
-            async with self._get_lock(file_path):
-                async with aiofiles.open(file_path, "r") as f:
-                    content = await f.read()
-                    return ProductData.model_validate_json(content)
-        except json.JSONDecodeError:
-            logger.error(f"Product file {file_path} is corrupted")
-            raise StorageError(f"Product file {file_path} is corrupted")
-        except Exception as e:
-            logger.error(f"Error reading product: {str(e)}")
-            raise StorageError(f"Error reading product: {str(e)}")
-    
-    async def get_products(self, product_ids: Sequence[str]) -> List[ProductData]:
-        """
-        Retrieve multiple products by ID.
+            if not await aiofiles.os.path.exists(file_path):
+                raise ProductNotFoundError(f"Product with ID {product_id} not found")
+            
+            async with aiofiles.open(file_path, "r") as f:
+                content = await f.read()
+                return ProductData.parse_raw(content)
         
-        This implementation uses asyncio.gather to load products concurrently.
+        except ProductNotFoundError:
+            raise
+        except (json.JSONDecodeError, PermissionError, OSError) as e:
+            logger.error(f"Error loading product {product_id}: {e}")
+            raise StorageConnectionError(f"Cannot load product: {e}")
+    
+    async def get_products(self, product_ids: List[str]) -> List[ProductData]:
+        """
+        Retrieve multiple products by their IDs.
         
         Args:
-            product_ids: Sequence of product IDs
+            product_ids: List of product IDs to retrieve.
             
         Returns:
-            List of ProductData objects for found products
+            List[ProductData]: The retrieved products.
+            
+        Note:
+            This method will not raise ProductNotFoundError if some products
+            don't exist. It will simply return the products that were found.
+            
+        Raises:
+            StorageConnectionError: If there's an error connecting to storage.
         """
         if not product_ids:
             return []
         
-        async def get_product_safe(pid: str) -> Optional[ProductData]:
-            try:
-                return await self.get_product(pid)
-            except (ProductNotFoundError, StorageError) as e:
-                logger.warning(f"Error loading product {pid}: {str(e)}")
-                return None
+        results = []
         
-        # Load products concurrently
-        results = await asyncio.gather(*[get_product_safe(pid) for pid in product_ids])
+        # Create tasks for each product retrieval
+        tasks = []
+        for product_id in product_ids:
+            tasks.append(self._get_product_with_suppressed_error(product_id))
         
-        # Filter out None results (failed loads)
-        return [p for p in results if p is not None]
+        # Execute all tasks concurrently
+        products = await asyncio.gather(*tasks)
+        
+        # Filter out None values (products that weren't found)
+        return [p for p in products if p is not None]
     
-    async def update_product(self, product_id: str, product_data: ProductData) -> bool:
+    async def _get_product_with_suppressed_error(self, product_id: str) -> Optional[ProductData]:
         """
-        Update existing product data.
+        Retrieve a product by ID, suppressing ProductNotFoundError.
         
         Args:
-            product_id: Product ID
-            product_data: Updated product data
+            product_id: The ID of the product to retrieve.
             
         Returns:
-            True if successful
+            Optional[ProductData]: The product data, or None if not found.
             
         Raises:
-            ProductNotFoundError: If the product is not found
-            StorageConnectionError: If there's an issue updating the product
+            StorageConnectionError: If there's an error connecting to storage.
+        """
+        try:
+            return await self.get_product(product_id)
+        except ProductNotFoundError:
+            return None
+    
+    async def update_product(self, product_id: str, product: ProductData) -> bool:
+        """
+        Update an existing product.
+        
+        Args:
+            product_id: The ID of the product to update.
+            product: The new product data.
+            
+        Returns:
+            bool: True if the update was successful.
+            
+        Raises:
+            ProductNotFoundError: If the product doesn't exist.
+            StorageConnectionError: If there's an error connecting to storage.
         """
         file_path = self._get_file_path(product_id)
         
-        if not file_path.exists():
+        # Check if the product exists
+        if not await aiofiles.os.path.exists(file_path):
             raise ProductNotFoundError(f"Product with ID {product_id} not found")
         
+        # Set the product ID to ensure consistency
+        product_dict = product.dict()
+        product_dict["id"] = product_id
+        product = ProductData(**product_dict)
+        
+        # Save the updated product
         try:
-            # Update the product file
-            async with self._get_lock(file_path):
-                async with aiofiles.open(file_path, "w") as f:
-                    await f.write(product_data.model_dump_json(indent=2))
-            
-            # Update the index
-            index = await self._load_index()
-            if product_id in index:
-                index[product_id].update({
-                    "url": str(product_data.url),
-                    "title": product_data.title,
-                    "brand": product_data.brand,
-                    "available": product_data.available,
-                    "extracted_at": product_data.extracted_at.isoformat() 
-                        if product_data.extracted_at else None,
-                    "identifiers": product_data.identifiers,
-                    "price_info": [{
-                        "amount": p.amount,
-                        "currency": p.currency
-                    } for p in product_data.prices] if product_data.prices else []
-                })
-                await self._save_index(index)
-            
-            return True
-            
+            async with aiofiles.open(file_path, "w") as f:
+                await f.write(product.json(indent=2))
         except (PermissionError, OSError) as e:
-            logger.error(f"Error updating product: {str(e)}")
-            raise StorageConnectionError(f"Error updating product: {str(e)}")
+            logger.error(f"Error updating product {product_id}: {e}")
+            raise StorageConnectionError(f"Cannot update product: {e}")
+        
+        # Update the index
+        try:
+            lock = FileLock(self.lock_path, timeout=self.lock_timeout)
+            with lock:
+                index = await self._load_index()
+                
+                if product_id in index:
+                    index[product_id].update({
+                        "url": product.url,
+                        "title": product.title,
+                        "brand": product.brand,
+                        "price": product.price.amount if product.price else None,
+                        "currency": product.price.currency if product.price else None,
+                        "identifiers": product.identifiers,
+                        "updated_at": datetime.now().isoformat()
+                    })
+                    
+                    await self._save_index(index)
+        except Exception as e:
+            logger.error(f"Error updating index for product {product_id}: {e}")
+            # We don't raise an exception here because the product file has been updated
+        
+        return True
     
     async def update_products(self, products: Dict[str, ProductData]) -> Dict[str, bool]:
         """
-        Update multiple products in a single batch operation.
-        
-        This optimized implementation reduces the number of index file operations
-        by updating the index once for all products.
+        Update multiple products in batch.
         
         Args:
-            products: Dictionary mapping product IDs to updated ProductData objects
+            products: Dictionary mapping product IDs to new product data.
             
         Returns:
-            Dictionary mapping product IDs to update success (True/False)
+            Dict[str, bool]: Dictionary mapping product IDs to success status.
+            
+        Raises:
+            StorageConnectionError: If there's an error connecting to storage.
         """
         if not products:
             return {}
@@ -428,102 +468,110 @@ class JSONStorage(BaseStorage):
         index = await self._load_index()
         index_updated = False
         
-        for product_id, product_data in products.items():
+        # Process each product
+        for product_id, product in products.items():
+            file_path = self._get_file_path(product_id)
+            
+            # Check if the product exists
+            if not await aiofiles.os.path.exists(file_path):
+                results[product_id] = False
+                continue
+            
+            # Set the product ID to ensure consistency
+            product_dict = product.dict()
+            product_dict["id"] = product_id
+            product = ProductData(**product_dict)
+            
             try:
-                file_path = self._get_file_path(product_id)
+                # Save the updated product
+                async with aiofiles.open(file_path, "w") as f:
+                    await f.write(product.json(indent=2))
                 
-                if not file_path.exists():
-                    logger.warning(f"Product with ID {product_id} not found, skipping")
-                    results[product_id] = False
-                    continue
-                
-                # Update product file
-                async with self._get_lock(file_path):
-                    async with aiofiles.open(file_path, "w") as f:
-                        await f.write(product_data.model_dump_json(indent=2))
-                
-                # Update index
+                # Update index entry
                 if product_id in index:
                     index[product_id].update({
-                        "url": str(product_data.url),
-                        "title": product_data.title,
-                        "brand": product_data.brand,
-                        "available": product_data.available,
-                        "extracted_at": product_data.extracted_at.isoformat() 
-                            if product_data.extracted_at else None,
-                        "identifiers": product_data.identifiers,
-                        "price_info": [{
-                            "amount": p.amount,
-                            "currency": p.currency
-                        } for p in product_data.prices] if product_data.prices else []
+                        "url": product.url,
+                        "title": product.title,
+                        "brand": product.brand,
+                        "price": product.price.amount if product.price else None,
+                        "currency": product.price.currency if product.price else None,
+                        "identifiers": product.identifiers,
+                        "updated_at": datetime.now().isoformat()
                     })
                     index_updated = True
                 
                 results[product_id] = True
-                
+            
             except Exception as e:
-                logger.error(f"Error updating product {product_id}: {str(e)}")
+                logger.error(f"Error updating product {product_id}: {e}")
                 results[product_id] = False
         
-        # Save index once if any products were updated
+        # Save the updated index
         if index_updated:
-            await self._save_index(index)
+            try:
+                lock = FileLock(self.lock_path, timeout=self.lock_timeout)
+                with lock:
+                    await self._save_index(index)
+            except Exception as e:
+                logger.error(f"Error updating index: {e}")
+                # We don't raise an exception here because some products may have been updated
         
         return results
     
     async def delete_product(self, product_id: str) -> bool:
         """
-        Delete a product from storage.
+        Delete a product.
         
         Args:
-            product_id: Product ID
+            product_id: The ID of the product to delete.
             
         Returns:
-            True if successful
+            bool: True if the deletion was successful.
             
         Raises:
-            ProductNotFoundError: If the product is not found
-            StorageConnectionError: If there's an issue deleting the product
+            ProductNotFoundError: If the product doesn't exist.
+            StorageConnectionError: If there's an error connecting to storage.
         """
         file_path = self._get_file_path(product_id)
         
-        if not file_path.exists():
+        # Check if the product exists
+        if not await aiofiles.os.path.exists(file_path):
             raise ProductNotFoundError(f"Product with ID {product_id} not found")
         
+        # Delete the product file
         try:
-            # Delete the product file
-            async with self._get_lock(file_path):
-                await aiofiles.os.remove(file_path)
-            
-            # Update the index
-            index = await self._load_index()
-            if product_id in index:
-                del index[product_id]
-                await self._save_index(index)
-            
-            # Remove the lock
-            path_str = str(file_path)
-            if path_str in self.locks:
-                del self.locks[path_str]
-            
-            return True
-            
+            await aiofiles.os.remove(file_path)
         except (PermissionError, OSError) as e:
-            logger.error(f"Error deleting product: {str(e)}")
-            raise StorageConnectionError(f"Error deleting product: {str(e)}")
-    
-    async def delete_products(self, product_ids: Sequence[str]) -> Dict[str, bool]:
-        """
-        Delete multiple products in a single batch operation.
+            logger.error(f"Error deleting product {product_id}: {e}")
+            raise StorageConnectionError(f"Cannot delete product: {e}")
         
-        This optimized implementation reduces the number of index file operations
-        by updating the index once for all products.
+        # Update the index
+        try:
+            lock = FileLock(self.lock_path, timeout=self.lock_timeout)
+            with lock:
+                index = await self._load_index()
+                
+                if product_id in index:
+                    del index[product_id]
+                    await self._save_index(index)
+        except Exception as e:
+            logger.error(f"Error updating index after deletion: {e}")
+            # We don't raise an exception here because the product file has been deleted
+        
+        return True
+    
+    async def delete_products(self, product_ids: List[str]) -> Dict[str, bool]:
+        """
+        Delete multiple products in batch.
         
         Args:
-            product_ids: Sequence of product IDs to delete
+            product_ids: List of product IDs to delete.
             
         Returns:
-            Dictionary mapping product IDs to deletion success (True/False)
+            Dict[str, bool]: Dictionary mapping product IDs to success status.
+            
+        Raises:
+            StorageConnectionError: If there's an error connecting to storage.
         """
         if not product_ids:
             return {}
@@ -532,171 +580,154 @@ class JSONStorage(BaseStorage):
         index = await self._load_index()
         index_updated = False
         
+        # Process each product
         for product_id in product_ids:
+            file_path = self._get_file_path(product_id)
+            
+            # Check if the product exists
+            if not await aiofiles.os.path.exists(file_path):
+                results[product_id] = False
+                continue
+            
             try:
-                file_path = self._get_file_path(product_id)
-                
-                if not file_path.exists():
-                    logger.warning(f"Product with ID {product_id} not found, skipping")
-                    results[product_id] = False
-                    continue
-                
-                # Delete product file
-                async with self._get_lock(file_path):
-                    await aiofiles.os.remove(file_path)
+                # Delete the product file
+                await aiofiles.os.remove(file_path)
                 
                 # Update index
                 if product_id in index:
                     del index[product_id]
                     index_updated = True
                 
-                # Remove lock
-                path_str = str(file_path)
-                if path_str in self.locks:
-                    del self.locks[path_str]
-                
                 results[product_id] = True
-                
+            
             except Exception as e:
-                logger.error(f"Error deleting product {product_id}: {str(e)}")
+                logger.error(f"Error deleting product {product_id}: {e}")
                 results[product_id] = False
         
-        # Save index once if any products were deleted
+        # Save the updated index
         if index_updated:
-            await self._save_index(index)
+            try:
+                lock = FileLock(self.lock_path, timeout=self.lock_timeout)
+                with lock:
+                    await self._save_index(index)
+            except Exception as e:
+                logger.error(f"Error updating index after deletion: {e}")
+                # We don't raise an exception here because some products may have been deleted
         
         return results
     
-    async def list_products(self, 
-                         filters: Optional[Dict[str, Any]] = None, 
-                         limit: int = 100, 
-                         offset: int = 0,
-                         sort_by: Optional[str] = None,
-                         sort_order: str = "asc") -> Tuple[List[ProductData], int]:
+    async def list_products(
+        self,
+        filters: Optional[Dict[str, Any]] = None,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
+        sort_by: Optional[str] = None,
+        sort_order: Optional[str] = "asc"
+    ) -> Tuple[List[ProductData], int]:
         """
         List products with optional filtering, pagination, and sorting.
         
         Args:
-            filters: Optional dictionary of filters to apply
-            limit: Maximum number of products to return
-            offset: Number of products to skip
-            sort_by: Field to sort by
-            sort_order: Sort order ("asc" or "desc")
+            filters: Dictionary mapping fields to filter values.
+            limit: Maximum number of products to return.
+            offset: Number of products to skip.
+            sort_by: Field to sort by.
+            sort_order: Sort order, "asc" or "desc".
             
         Returns:
-            Tuple of (products list, total count)
+            Tuple[List[ProductData], int]: List of products and total count.
             
         Raises:
-            StorageConnectionError: If there's an issue listing products
+            StorageConnectionError: If there's an error connecting to storage.
         """
         try:
             # Load the index
             index = await self._load_index()
             
-            # Filter products
+            # Apply filters
             if filters:
-                product_ids = [pid for pid, data in index.items() 
-                              if self._matches_filters(data, filters)]
+                filtered_ids = []
+                for product_id, metadata in index.items():
+                    if await self._matches_filters(metadata, filters):
+                        filtered_ids.append(product_id)
             else:
-                product_ids = list(index.keys())
+                filtered_ids = list(index.keys())
             
-            # Sort products
+            # Apply sorting
             if sort_by:
-                if sort_by == "price":
-                    # Special case for price sorting
-                    # This sorts by the first price in the list
-                    def price_key(pid):
-                        price_info = index[pid].get("price_info", [])
-                        if price_info:
-                            try:
-                                return float(price_info[0].get("amount", 0))
-                            except (ValueError, TypeError):
-                                return 0
-                        return 0
-                    
-                    product_ids.sort(key=price_key, reverse=(sort_order.lower() == "desc"))
-                else:
-                    # General sorting by index field
-                    def sort_key(pid):
-                        if "." in sort_by:
-                            # Handle nested fields (e.g., "price_info.amount")
-                            parts = sort_by.split(".")
-                            value = index[pid]
-                            for part in parts:
-                                if isinstance(value, dict) and part in value:
-                                    value = value[part]
-                                else:
-                                    value = None
-                                    break
-                            return value or ""
-                        else:
-                            # Simple field
-                            return index[pid].get(sort_by, "")
-                    
-                    product_ids.sort(key=sort_key, reverse=(sort_order.lower() == "desc"))
+                try:
+                    # Sort by the specified field
+                    sorted_ids = sorted(
+                        filtered_ids,
+                        key=lambda id_: index.get(id_, {}).get(sort_by, ""),
+                        reverse=(sort_order.lower() == "desc")
+                    )
+                except (KeyError, TypeError):
+                    # Fallback to sorting by ID
+                    sorted_ids = sorted(
+                        filtered_ids,
+                        reverse=(sort_order.lower() == "desc")
+                    )
+            else:
+                # Default sort by ID
+                sorted_ids = sorted(filtered_ids)
             
             # Apply pagination
-            total_count = len(product_ids)
-            paginated_ids = product_ids[offset:offset + limit]
+            total_count = len(sorted_ids)
+            if offset is not None:
+                sorted_ids = sorted_ids[offset:]
+            if limit is not None:
+                sorted_ids = sorted_ids[:limit]
             
-            # Load product data using batch method
-            products = await self.get_products(paginated_ids)
+            # Retrieve the products
+            products = await self.get_products(sorted_ids)
             
             return products, total_count
-            
-        except Exception as e:
-            logger.error(f"Error listing products: {str(e)}")
-            raise StorageConnectionError(f"Error listing products: {str(e)}")
+        
+        except (PermissionError, OSError, json.JSONDecodeError) as e:
+            logger.error(f"Error listing products: {e}")
+            raise StorageConnectionError(f"Cannot list products: {e}")
     
-    def _matches_filters(self, data: Dict[str, Any], filters: Dict[str, Any]) -> bool:
+    async def _matches_filters(self, metadata: Dict[str, Any], filters: Dict[str, Any]) -> bool:
         """
-        Check if product metadata matches filters.
+        Check if the product's metadata matches the given filters.
         
         Args:
-            data: Product metadata from the index
-            filters: Dictionary of filters to apply
+            metadata: The product metadata from the index.
+            filters: Dictionary mapping fields to filter values.
             
         Returns:
-            True if the product matches all filters, False otherwise
+            bool: True if the metadata matches the filters.
         """
         for field, value in filters.items():
-            if field not in data:
-                return False
-            
-            field_value = data[field]
+            # Handle nested fields
+            if "." in field:
+                parts = field.split(".")
+                field_value = metadata
+                for part in parts:
+                    if isinstance(field_value, dict) and part in field_value:
+                        field_value = field_value[part]
+                    else:
+                        field_value = None
+                        break
+            else:
+                field_value = metadata.get(field)
             
             # Handle different filter types
-            if isinstance(value, (str, int, float, bool)):
-                # Simple equality for primitive types
-                if isinstance(field_value, str) and isinstance(value, str):
-                    # Case-insensitive substring match for strings
-                    if value.lower() not in field_value.lower():
+            if isinstance(value, dict):
+                # Range filter
+                if "min" in value and field_value is not None:
+                    if field_value < value["min"]:
                         return False
-                elif field_value != value:
-                    return False
+                if "max" in value and field_value is not None:
+                    if field_value > value["max"]:
+                        return False
             elif isinstance(value, list):
-                # Check if any value in the list matches
-                if not any(v == field_value for v in value):
+                # Multiple value filter
+                if field_value not in value:
                     return False
-            elif isinstance(value, dict):
-                # For nested filters (e.g., {"price": {"min": 10, "max": 100}})
-                for subfield, subvalue in value.items():
-                    if subfield == "min" and isinstance(field_value, (int, float)):
-                        if field_value < subvalue:
-                            return False
-                    elif subfield == "max" and isinstance(field_value, (int, float)):
-                        if field_value > subvalue:
-                            return False
-                    elif subfield == "contains" and isinstance(field_value, list):
-                        if subvalue not in field_value:
-                            return False
-                    elif subfield == "regex" and isinstance(field_value, str):
-                        if not re.search(subvalue, field_value):
-                            return False
-                    elif field_value != subvalue:
-                        return False
-            else:
-                # Unsupported filter type
+            elif field_value != value:
+                # Exact match filter
                 return False
         
         return True
