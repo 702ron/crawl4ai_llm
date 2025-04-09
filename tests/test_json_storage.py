@@ -1,497 +1,534 @@
 """
-Tests for JSON file-based storage implementation.
+Tests for the JSONStorage class.
 """
 
-import os
+import asyncio
 import json
+import os
 import shutil
 import tempfile
-from pathlib import Path
 from datetime import datetime
+from typing import Dict, Any, List
+
 import pytest
-from pydantic import HttpUrl
 
-from crawl4ai_llm.config import StorageConfig
-from crawl4ai_llm.models import ProductData, ProductPrice, ProductImage
+from crawl4ai_llm.storage.base import (
+    StorageConnectionError,
+    ProductNotFoundError,
+    DuplicateProductError,
+)
 from crawl4ai_llm.storage.json_storage import JSONStorage
-from crawl4ai_llm.storage.base import ProductNotFoundError, DuplicateProductError, StorageConnectionError
 
-# Test fixtures
 
 @pytest.fixture
-def temp_dir():
-    """Create a temporary directory for testing."""
+def storage_dir():
+    """Temporary directory for storage tests."""
     temp_dir = tempfile.mkdtemp()
     yield temp_dir
+    # Clean up after the test
     shutil.rmtree(temp_dir)
 
-@pytest.fixture
-def storage_config(temp_dir):
-    """Create a storage configuration for testing."""
-    return StorageConfig(
-        type="json",
-        path=temp_dir,
-        use_uuid=False,
-        create_if_missing=True,
-        lock_timeout=10,
-        filename_template="{id}.json"
-    )
 
 @pytest.fixture
-def storage(storage_config):
-    """Create a JSON storage instance for testing."""
-    return JSONStorage(storage_config)
+def storage(storage_dir):
+    """JSONStorage instance for testing."""
+    return JSONStorage(storage_dir)
+
 
 @pytest.fixture
 def sample_product():
-    """Create a sample product for testing."""
-    return ProductData(
-        url=HttpUrl("https://example.com/product1"),
-        title="Test Product 1",
-        description="This is a test product",
-        brand="Test Brand",
-        available=True,
-        extracted_at=datetime.now(),
-        prices=[
-            ProductPrice(amount=19.99, currency="USD", type="regular")
-        ],
-        images=[
-            ProductImage(url=HttpUrl("https://example.com/image1.jpg"), alt="Test Image 1")
-        ],
-        attributes={
-            "color": "red",
-            "size": "medium"
+    """Sample product data for testing."""
+    return {
+        "title": "Test Product",
+        "description": "This is a test product",
+        "price": {
+            "current": 99.99,
+            "currency": "USD",
         },
-        identifiers={
-            "sku": "SKU123456",
-            "upc": "123456789012"
+        "sku": "TEST-123",
+        "url": "https://example.com/products/test-123",
+        "store_name": "Test Store",
+        "images": [
+            {
+                "url": "https://example.com/images/test-123-1.jpg",
+                "alt": "Test Product Image 1",
+            }
+        ],
+        "attributes": {
+            "color": "Red",
+            "size": "Medium",
         }
-    )
+    }
+
 
 @pytest.fixture
-def sample_products():
-    """Create multiple sample products for testing."""
+def batch_products():
+    """List of sample products for batch testing."""
     return [
-        ProductData(
-            url=HttpUrl("https://example.com/product1"),
-            title="Test Product 1",
-            description="This is test product 1",
-            brand="Brand A",
-            available=True,
-            extracted_at=datetime.now(),
-            prices=[
-                ProductPrice(amount=19.99, currency="USD", type="regular")
-            ],
-            identifiers={"sku": "SKU1"}
-        ),
-        ProductData(
-            url=HttpUrl("https://example.com/product2"),
-            title="Test Product 2",
-            description="This is test product 2",
-            brand="Brand B",
-            available=False,
-            extracted_at=datetime.now(),
-            prices=[
-                ProductPrice(amount=29.99, currency="USD", type="regular")
-            ],
-            identifiers={"sku": "SKU2"}
-        ),
-        ProductData(
-            url=HttpUrl("https://example.com/product3"),
-            title="Test Product 3",
-            description="This is test product 3",
-            brand="Brand A",
-            available=True,
-            extracted_at=datetime.now(),
-            prices=[
-                ProductPrice(amount=9.99, currency="USD", type="regular")
-            ],
-            identifiers={"sku": "SKU3"}
-        )
+        {
+            "title": "Product 1",
+            "sku": "SKU-001",
+            "store_name": "Test Store",
+            "url": "https://example.com/products/1",
+            "price": {"current": 10.99, "currency": "USD"},
+        },
+        {
+            "title": "Product 2",
+            "sku": "SKU-002",
+            "store_name": "Test Store",
+            "url": "https://example.com/products/2",
+            "price": {"current": 20.99, "currency": "USD"},
+        },
+        {
+            "title": "Product 3",
+            "sku": "SKU-003",
+            "store_name": "Test Store",
+            "url": "https://example.com/products/3",
+            "price": {"current": 30.99, "currency": "USD"},
+        }
     ]
 
-# Test cases
 
-@pytest.mark.asyncio
-async def test_init_storage(temp_dir):
+async def test_storage_init(storage_dir):
     """Test storage initialization."""
-    config = StorageConfig(
-        type="json",
-        path=temp_dir,
-        use_uuid=False,
-        create_if_missing=True
-    )
+    storage = JSONStorage(storage_dir)
+    assert os.path.exists(storage.index_path)
     
-    storage = JSONStorage(config)
-    assert storage.storage_path == Path(temp_dir)
-    assert storage.index_path == Path(temp_dir) / "index.json"
+    # Check that the index file is created and is valid JSON
+    with open(storage.index_path, "r") as f:
+        index = json.load(f)
+        assert isinstance(index, dict)
 
-@pytest.mark.asyncio
-async def test_init_storage_create_dir(temp_dir):
-    """Test storage initialization with directory creation."""
-    new_path = os.path.join(temp_dir, "storage")
-    config = StorageConfig(
-        type="json",
-        path=new_path,
-        use_uuid=False,
-        create_if_missing=True
-    )
-    
-    storage = JSONStorage(config)
-    assert storage.storage_path == Path(new_path)
-    assert os.path.exists(new_path)
 
-@pytest.mark.asyncio
 async def test_save_product(storage, sample_product):
     """Test saving a product."""
     product_id = await storage.save_product(sample_product)
-    assert product_id == "sku_SKU123456"
     
-    # Check that the product file exists
+    # Check that the product was saved to a file
     file_path = storage._get_file_path(product_id)
-    assert file_path.exists()
+    assert os.path.exists(file_path)
     
     # Check that the index was updated
-    index = await storage._load_index()
-    assert product_id in index
-    assert index[product_id]["title"] == sample_product.title
+    with open(storage.index_path, "r") as f:
+        index = json.load(f)
+        assert product_id in index
+        assert index[product_id]["title"] == sample_product["title"]
+    
+    # Check that metadata was added
+    with open(file_path, "r") as f:
+        product_data = json.load(f)
+        assert "metadata" in product_data
+        assert "created_at" in product_data["metadata"]
+        assert "updated_at" in product_data["metadata"]
 
-@pytest.mark.asyncio
-async def test_save_products_batch(storage, sample_products):
-    """Test saving multiple products in a batch."""
-    product_ids = await storage.save_products(sample_products)
-    assert len(product_ids) == 3
-    
-    # Check that all product files exist
-    for product_id in product_ids:
-        file_path = storage._get_file_path(product_id)
-        assert file_path.exists()
-    
-    # Check that the index was updated with all products
-    index = await storage._load_index()
-    assert len(index) == 3
-    
-    # Verify specific product in index
-    assert "sku_SKU1" in index
-    assert index["sku_SKU1"]["title"] == "Test Product 1"
-    assert "sku_SKU2" in index
-    assert index["sku_SKU2"]["title"] == "Test Product 2"
 
-@pytest.mark.asyncio
 async def test_get_product(storage, sample_product):
     """Test retrieving a product."""
     product_id = await storage.save_product(sample_product)
     
-    retrieved = await storage.get_product(product_id)
-    assert retrieved.title == sample_product.title
-    assert retrieved.description == sample_product.description
-    assert retrieved.brand == sample_product.brand
-    assert retrieved.url == sample_product.url
+    # Retrieve the product
+    product_data = await storage.get_product(product_id)
+    
+    # Check that the product data is correct
+    assert product_data["title"] == sample_product["title"]
+    assert product_data["description"] == sample_product["description"]
+    assert product_data["id"] == product_id
 
-@pytest.mark.asyncio
-async def test_get_products_batch(storage, sample_products):
-    """Test retrieving multiple products in a batch."""
-    product_ids = await storage.save_products(sample_products)
-    
-    retrieved = await storage.get_products(product_ids)
-    assert len(retrieved) == 3
-    
-    # Verify products are retrieved correctly
-    titles = [p.title for p in retrieved]
-    assert "Test Product 1" in titles
-    assert "Test Product 2" in titles
-    assert "Test Product 3" in titles
 
-@pytest.mark.asyncio
-async def test_get_products_partial_success(storage, sample_products):
-    """Test retrieving multiple products with some not found."""
-    product_ids = await storage.save_products(sample_products[:2])
-    
-    # Try to get 3 products, but only 2 exist
-    retrieved = await storage.get_products(["sku_SKU1", "sku_SKU2", "sku_SKU3"])
-    assert len(retrieved) == 2
-    
-    titles = [p.title for p in retrieved]
-    assert "Test Product 1" in titles
-    assert "Test Product 2" in titles
-
-@pytest.mark.asyncio
 async def test_update_product(storage, sample_product):
     """Test updating a product."""
     product_id = await storage.save_product(sample_product)
     
-    # Update the product
-    updated_product = sample_product.model_copy(deep=True)
-    updated_product.title = "Updated Product Title"
-    updated_product.available = False
+    # Get the initial update timestamp
+    product_data = await storage.get_product(product_id)
+    initial_updated_at = product_data["metadata"]["updated_at"]
     
-    result = await storage.update_product(product_id, updated_product)
-    assert result is True
+    # Wait a bit to ensure the timestamp changes
+    await asyncio.sleep(0.1)
+    
+    # Update the product
+    updated_product = {
+        "id": product_id,
+        "title": "Updated Product",
+        "price": {
+            "current": 79.99,
+            "currency": "USD",
+        }
+    }
+    await storage.update_product(updated_product)
     
     # Retrieve the updated product
-    retrieved = await storage.get_product(product_id)
-    assert retrieved.title == "Updated Product Title"
-    assert retrieved.available is False
+    updated_data = await storage.get_product(product_id)
     
-    # Check index was updated
-    index = await storage._load_index()
-    assert index[product_id]["title"] == "Updated Product Title"
-    assert index[product_id]["available"] is False
+    # Check that the update was applied
+    assert updated_data["title"] == "Updated Product"
+    assert updated_data["price"]["current"] == 79.99
+    assert updated_data["description"] == sample_product["description"]  # Unchanged field
+    
+    # Check that the updated_at timestamp was updated
+    assert updated_data["metadata"]["updated_at"] != initial_updated_at
 
-@pytest.mark.asyncio
-async def test_update_products_batch(storage, sample_products):
-    """Test updating multiple products in a batch."""
-    product_ids = await storage.save_products(sample_products)
-    
-    # Create updates
-    updates = {}
-    for i, pid in enumerate(product_ids):
-        product = await storage.get_product(pid)
-        updated = product.model_copy(deep=True)
-        updated.title = f"Updated Product {i+1}"
-        updated.available = not product.available
-        updates[pid] = updated
-    
-    # Update all products
-    results = await storage.update_products(updates)
-    
-    # Verify all updates succeeded
-    assert all(results.values())
-    assert len(results) == 3
-    
-    # Check products were actually updated
-    for pid in product_ids:
-        retrieved = await storage.get_product(pid)
-        assert retrieved.title.startswith("Updated Product")
-    
-    # Check index was updated
-    index = await storage._load_index()
-    for pid in product_ids:
-        assert index[pid]["title"].startswith("Updated Product")
 
-@pytest.mark.asyncio
 async def test_delete_product(storage, sample_product):
     """Test deleting a product."""
     product_id = await storage.save_product(sample_product)
-    file_path = storage._get_file_path(product_id)
+    
+    # Check that the product exists
+    assert os.path.exists(storage._get_file_path(product_id))
     
     # Delete the product
     result = await storage.delete_product(product_id)
     assert result is True
     
-    # Check file was removed
-    assert not file_path.exists()
+    # Check that the product file was deleted
+    assert not os.path.exists(storage._get_file_path(product_id))
     
-    # Check index was updated
-    index = await storage._load_index()
-    assert product_id not in index
+    # Check that the index was updated
+    with open(storage.index_path, "r") as f:
+        index = json.load(f)
+        assert product_id not in index
     
-    # Check product is not retrievable
+    # Verify that trying to get the deleted product raises an error
     with pytest.raises(ProductNotFoundError):
         await storage.get_product(product_id)
 
-@pytest.mark.asyncio
-async def test_delete_products_batch(storage, sample_products):
-    """Test deleting multiple products in a batch."""
-    product_ids = await storage.save_products(sample_products)
-    
-    # Delete products
-    results = await storage.delete_products(product_ids)
-    
-    # Verify all deletions succeeded
-    assert all(results.values())
-    assert len(results) == 3
-    
-    # Check files were removed
-    for pid in product_ids:
-        file_path = storage._get_file_path(pid)
-        assert not file_path.exists()
-    
-    # Check index was updated
-    index = await storage._load_index()
-    assert len(index) == 0
-    
-    # Check products are not retrievable
-    for pid in product_ids:
-        with pytest.raises(ProductNotFoundError):
-            await storage.get_product(pid)
 
-@pytest.mark.asyncio
-async def test_list_products(storage, sample_products):
+async def test_list_products(storage, sample_product):
     """Test listing products."""
-    await storage.save_products(sample_products)
+    # Save multiple products
+    products = []
+    for i in range(5):
+        product = sample_product.copy()
+        product["title"] = f"Product {i}"
+        product["sku"] = f"TEST-{i}"
+        product_id = await storage.save_product(product)
+        products.append(product_id)
     
-    products, count = await storage.list_products()
-    assert count == 3
+    # List all products
+    result = await storage.list_products()
+    assert result["total"] == 5
+    assert len(result["products"]) == 5
+    assert result["page"] == 1
+    assert result["page_size"] == 100
+    assert result["total_pages"] == 1
+    
+    # Test pagination
+    result = await storage.list_products(page=1, page_size=2)
+    assert result["total"] == 5
+    assert len(result["products"]) == 2
+    assert result["page"] == 1
+    assert result["page_size"] == 2
+    assert result["total_pages"] == 3
+    
+    # Test filtering
+    product = sample_product.copy()
+    product["title"] = "Special Product"
+    product["category"] = "Electronics"
+    await storage.save_product(product)
+    
+    result = await storage.list_products(filters={"category": "Electronics"})
+    assert result["total"] == 1
+    assert result["products"][0]["title"] == "Special Product"
+    
+    # Test sorting
+    result = await storage.list_products(sort_by="title", sort_order="asc")
+    titles = [p["title"] for p in result["products"]]
+    assert titles == sorted(titles)
+    
+    result = await storage.list_products(sort_by="title", sort_order="desc")
+    titles = [p["title"] for p in result["products"]]
+    assert titles == sorted(titles, reverse=True)
+
+
+async def test_batch_save_products(storage, batch_products):
+    """Test saving multiple products in a batch."""
+    product_ids = await storage.save_products(batch_products)
+    
+    # Check that we got the right number of IDs
+    assert len(product_ids) == 3
+    
+    # Check that all products were saved correctly
+    for i, product_id in enumerate(product_ids):
+        # Verify file exists
+        file_path = storage._get_file_path(product_id)
+        assert os.path.exists(file_path)
+        
+        # Verify data integrity
+        product_data = await storage.get_product(product_id)
+        assert product_data["title"] == batch_products[i]["title"]
+        assert product_data["sku"] == batch_products[i]["sku"]
+        
+        # Verify metadata was added
+        assert "metadata" in product_data
+        assert "created_at" in product_data["metadata"]
+        assert "updated_at" in product_data["metadata"]
+    
+    # Check that the index was updated with all products
+    with open(storage.index_path, "r") as f:
+        index = json.load(f)
+        for product_id in product_ids:
+            assert product_id in index
+
+
+async def test_batch_get_products(storage, batch_products):
+    """Test retrieving multiple products in a batch."""
+    product_ids = await storage.save_products(batch_products)
+    
+    # Retrieve all products in a batch
+    products = await storage.get_products(product_ids)
+    
+    # Check that we got all products
     assert len(products) == 3
+    
+    # Check that data is correct
+    for i, product in enumerate(products):
+        assert product["title"] == batch_products[i]["title"]
+        assert product["sku"] == batch_products[i]["sku"]
+    
+    # Test retrieving a subset
+    subset_ids = product_ids[:2]
+    subset_products = await storage.get_products(subset_ids)
+    assert len(subset_products) == 2
+    
+    # Test error for non-existent product
+    with pytest.raises(ProductNotFoundError):
+        await storage.get_products([product_ids[0], "non-existent-id"])
+    
+    # Test empty list case
+    empty_result = await storage.get_products([])
+    assert empty_result == []
 
-@pytest.mark.asyncio
-async def test_list_products_with_filters(storage, sample_products):
-    """Test listing products with filters."""
-    await storage.save_products(sample_products)
-    
-    # Filter by brand
-    products, count = await storage.list_products({"brand": "Brand A"})
-    assert count == 2
-    assert len(products) == 2
-    assert all(p.brand == "Brand A" for p in products)
-    
-    # Filter by availability
-    products, count = await storage.list_products({"available": True})
-    assert count == 2
-    assert len(products) == 2
-    assert all(p.available for p in products)
-    
-    # Filter by brand and availability
-    products, count = await storage.list_products({
-        "brand": "Brand A",
-        "available": True
-    })
-    assert count == 2
-    assert len(products) == 2
-    assert all(p.brand == "Brand A" and p.available for p in products)
 
-@pytest.mark.asyncio
-async def test_list_products_pagination(storage, sample_products):
-    """Test listing products with pagination."""
-    await storage.save_products(sample_products)
+async def test_batch_update_products(storage, batch_products):
+    """Test updating multiple products in a batch."""
+    product_ids = await storage.save_products(batch_products)
     
-    # First page
-    products, count = await storage.list_products(limit=2, offset=0)
-    assert count == 3  # Total count should be 3
-    assert len(products) == 2  # But only 2 returned due to limit
+    # Get original update timestamps
+    original_products = await storage.get_products(product_ids)
+    original_timestamps = [p["metadata"]["updated_at"] for p in original_products]
     
-    # Second page
-    products, count = await storage.list_products(limit=2, offset=2)
-    assert count == 3
-    assert len(products) == 1  # Only 1 remaining product
+    # Wait to ensure timestamps change
+    await asyncio.sleep(0.1)
+    
+    # Prepare updates
+    updates = [
+        {"id": product_ids[0], "price": {"current": 15.99, "currency": "USD"}},
+        {"id": product_ids[1], "price": {"current": 25.99, "currency": "USD"}},
+        {"id": product_ids[2], "price": {"current": 35.99, "currency": "USD"}}
+    ]
+    
+    # Perform batch update
+    updated_ids = await storage.update_products(updates)
+    assert len(updated_ids) == 3
+    assert set(updated_ids) == set(product_ids)
+    
+    # Verify the updates were applied
+    updated_products = await storage.get_products(product_ids)
+    
+    for i, product in enumerate(updated_products):
+        assert product["price"]["current"] == updates[i]["price"]["current"]
+        assert product["title"] == batch_products[i]["title"]  # Unchanged field
+        
+        # Check that the updated_at timestamp was updated
+        assert product["metadata"]["updated_at"] != original_timestamps[i]
+    
+    # Test error for non-existent product
+    bad_updates = [
+        {"id": product_ids[0], "price": {"current": 16.99}},
+        {"id": "non-existent-id", "price": {"current": 26.99}}
+    ]
+    with pytest.raises(ProductNotFoundError):
+        await storage.update_products(bad_updates)
+    
+    # Test missing ID
+    with pytest.raises(ValueError):
+        await storage.update_products([{"price": {"current": 17.99}}])
+    
+    # Test empty list case
+    empty_result = await storage.update_products([])
+    assert empty_result == []
 
-@pytest.mark.asyncio
-async def test_list_products_sorting(storage, sample_products):
-    """Test listing products with sorting."""
-    await storage.save_products(sample_products)
-    
-    # Sort by title ascending
-    products, _ = await storage.list_products(sort_by="title", sort_order="asc")
-    titles = [p.title for p in products]
-    assert titles == ["Test Product 1", "Test Product 2", "Test Product 3"]
-    
-    # Sort by title descending
-    products, _ = await storage.list_products(sort_by="title", sort_order="desc")
-    titles = [p.title for p in products]
-    assert titles == ["Test Product 3", "Test Product 2", "Test Product 1"]
-    
-    # Sort by price ascending
-    products, _ = await storage.list_products(sort_by="price", sort_order="asc")
-    prices = [p.prices[0].amount for p in products]
-    assert prices == [9.99, 19.99, 29.99]
-    
-    # Sort by price descending
-    products, _ = await storage.list_products(sort_by="price", sort_order="desc")
-    prices = [p.prices[0].amount for p in products]
-    assert prices == [29.99, 19.99, 9.99]
 
-@pytest.mark.asyncio
+async def test_batch_delete_products(storage, batch_products):
+    """Test deleting multiple products in a batch."""
+    product_ids = await storage.save_products(batch_products)
+    
+    # Check that all products exist
+    for product_id in product_ids:
+        assert os.path.exists(storage._get_file_path(product_id))
+    
+    # Delete all products
+    deleted_count = await storage.delete_products(product_ids)
+    assert deleted_count == 3
+    
+    # Check that all files were deleted
+    for product_id in product_ids:
+        assert not os.path.exists(storage._get_file_path(product_id))
+    
+    # Check that the index was updated
+    with open(storage.index_path, "r") as f:
+        index = json.load(f)
+        for product_id in product_ids:
+            assert product_id not in index
+    
+    # Verify that trying to get any deleted product raises an error
+    for product_id in product_ids:
+        with pytest.raises(ProductNotFoundError):
+            await storage.get_product(product_id)
+    
+    # Test error for non-existent product
+    with pytest.raises(ProductNotFoundError):
+        await storage.delete_products(["non-existent-id"])
+    
+    # Test empty list case
+    empty_result = await storage.delete_products([])
+    assert empty_result == 0
+
+
 async def test_product_not_found(storage):
-    """Test handling of non-existent products."""
+    """Test error handling for product not found."""
     with pytest.raises(ProductNotFoundError):
-        await storage.get_product("non_existent_id")
+        await storage.get_product("non-existent-id")
     
     with pytest.raises(ProductNotFoundError):
-        await storage.update_product("non_existent_id", 
-                                    ProductData(
-                                        url=HttpUrl("https://example.com/product"),
-                                        title="Test Product"
-                                    ))
+        await storage.update_product({"id": "non-existent-id", "title": "Updated"})
     
     with pytest.raises(ProductNotFoundError):
-        await storage.delete_product("non_existent_id")
+        await storage.delete_product("non-existent-id")
 
-@pytest.mark.asyncio
+
 async def test_duplicate_product(storage, sample_product):
-    """Test handling of duplicate products."""
+    """Test error handling for duplicate products."""
     product_id = await storage.save_product(sample_product)
     
-    # Try to save the same product again
+    # Try to save a product with the same ID
+    duplicate_product = sample_product.copy()
+    duplicate_product["id"] = product_id
+    
+    with pytest.raises(DuplicateProductError):
+        await storage.save_product(duplicate_product)
+    
+    # Try to save a product with the same SKU and store name
     with pytest.raises(DuplicateProductError):
         await storage.save_product(sample_product)
 
-@pytest.mark.asyncio
-async def test_storage_connection_error(temp_dir):
-    """Test handling of storage connection errors."""
-    # Create a read-only directory
-    read_only_dir = os.path.join(temp_dir, "read_only")
-    os.mkdir(read_only_dir)
-    os.chmod(read_only_dir, 0o500)  # read and execute, but not write
-    
-    config = StorageConfig(
-        type="json",
-        path=read_only_dir,
-        use_uuid=False,
-        create_if_missing=False
-    )
-    
-    storage = JSONStorage(config)
-    
-    # Try to save a product to a read-only directory
-    with pytest.raises(StorageConnectionError):
-        await storage.save_product(
-            ProductData(
-                url=HttpUrl("https://example.com/product"),
-                title="Test Product"
-            )
-        )
-    
-    # Restore permissions
-    os.chmod(read_only_dir, 0o700)
 
-@pytest.mark.asyncio
-async def test_concurrent_batch_operations(storage, sample_products, sample_product):
-    """Test concurrent batch operations."""
-    import asyncio
+async def test_storage_connection_error():
+    """Test error handling for storage connection errors."""
+    # Create a read-only directory
+    with tempfile.TemporaryDirectory() as temp_dir:
+        read_only_dir = os.path.join(temp_dir, "read_only")
+        os.makedirs(read_only_dir)
+        os.chmod(read_only_dir, 0o500)  # Read and execute only
+        
+        # Try to create storage in a read-only directory
+        with pytest.raises(StorageConnectionError):
+            storage = JSONStorage(read_only_dir)
+            product = {"title": "Test"}
+            await storage.save_product(product)
+
+
+async def test_multiple_storage_instances(storage_dir, sample_product):
+    """Test that multiple storage instances can interact correctly."""
+    storage1 = JSONStorage(storage_dir)
+    storage2 = JSONStorage(storage_dir)
     
-    # Save initial products
-    await storage.save_products(sample_products)
+    # Save a product using the first instance
+    product_id = await storage1.save_product(sample_product)
     
-    # Define some concurrent operations
-    async def batch_update():
-        updates = {}
-        products, _ = await storage.list_products()
-        for product in products:
-            product_id = storage._get_product_id(product)
-            updated = product.model_copy(deep=True)
-            updated.title = f"{product.title} (Updated)"
-            updates[product_id] = updated
-        return await storage.update_products(updates)
+    # Get the product using the second instance
+    product_data = await storage2.get_product(product_id)
+    assert product_data["title"] == sample_product["title"]
     
-    async def batch_save():
-        new_products = []
-        for i in range(3):
-            new_product = sample_product.model_copy(deep=True)
-            new_product.title = f"New Batch Product {i+1}"
-            new_product.identifiers = {"sku": f"NEW{i+1}"}
-            new_products.append(new_product)
-        return await storage.save_products(new_products)
+    # Update the product using the second instance
+    updated_product = {"id": product_id, "title": "Updated by Instance 2"}
+    await storage2.update_product(updated_product)
     
-    # Run operations concurrently
-    update_task = asyncio.create_task(batch_update())
-    save_task = asyncio.create_task(batch_save())
+    # Verify the update using the first instance
+    updated_data = await storage1.get_product(product_id)
+    assert updated_data["title"] == "Updated by Instance 2"
+
+
+async def test_index_file_corruption(storage_dir, sample_product):
+    """Test resilience against index file corruption."""
+    storage = JSONStorage(storage_dir)
     
-    update_results = await update_task
-    save_results = await save_task
+    # Save a product
+    product_id = await storage.save_product(sample_product)
     
-    # Verify results
-    assert all(update_results.values())
-    assert len(save_results) == 3
+    # Corrupt the index file
+    with open(storage.index_path, "w") as f:
+        f.write("This is not valid JSON")
     
-    # Verify all products are in the index
-    products, count = await storage.list_products()
-    assert count == 6  # 3 original + 3 new
+    # Test that we can still get products, but listing returns empty
+    product_data = await storage.get_product(product_id)
+    assert product_data["title"] == sample_product["title"]
     
-    # Check that updates were applied
-    updated_titles = [p.title for p in products if "(Updated)" in p.title]
-    assert len(updated_titles) == 3
+    result = await storage.list_products()
+    assert result["total"] == 0
+    assert len(result["products"]) == 0
+
+
+async def test_custom_id_generation(storage):
+    """Test custom ID generation logic."""
+    # Test product with specific ID
+    product1 = {"id": "custom-id", "title": "Product with Custom ID"}
+    product_id1 = await storage.save_product(product1)
+    assert product_id1 == "custom-id"
     
-    # Check that new products were added
-    new_titles = [p.title for p in products if "New Batch Product" in p.title]
-    assert len(new_titles) == 3
+    # Test product with SKU and store name
+    product2 = {"sku": "ABC123", "store_name": "Test Store", "title": "Product with SKU"}
+    product_id2 = await storage.save_product(product2)
+    assert product_id2 == "Test Store_ABC123"
+    
+    # Test product with URL
+    product3 = {"url": "https://example.com/product/123", "title": "Product with URL"}
+    product_id3 = await storage.save_product(product3)
+    assert product_id3.startswith("url_")
+    
+    # Test product with no identifiers
+    product4 = {"title": "Product with no identifiers"}
+    product_id4 = await storage.save_product(product4)
+    assert len(product_id4) > 0  # Should generate a random UUID
+
+
+async def test_complex_filters(storage):
+    """Test complex filtering scenarios."""
+    # Save products with various attributes
+    products = [
+        {
+            "title": "Laptop",
+            "category": "Electronics",
+            "price": {"current": 999.99, "currency": "USD"},
+            "metadata": {"tags": ["computer", "work"]}
+        },
+        {
+            "title": "Phone",
+            "category": "Electronics",
+            "price": {"current": 499.99, "currency": "USD"},
+            "metadata": {"tags": ["mobile", "communication"]}
+        },
+        {
+            "title": "Desk",
+            "category": "Furniture",
+            "price": {"current": 199.99, "currency": "USD"},
+            "metadata": {"tags": ["work", "home"]}
+        }
+    ]
+    
+    for product in products:
+        await storage.save_product(product)
+    
+    # Test filtering by category
+    result = await storage.list_products(filters={"category": "Electronics"})
+    assert result["total"] == 2
+    assert {p["title"] for p in result["products"]} == {"Laptop", "Phone"}
+    
+    # Test filtering by metadata
+    result = await storage.list_products(filters={"metadata.tags": ["work", "home"]})
+    assert result["total"] == 1
+    assert result["products"][0]["title"] == "Desk"
+    
+    # Test no matches
+    result = await storage.list_products(filters={"category": "Clothing"})
+    assert result["total"] == 0
