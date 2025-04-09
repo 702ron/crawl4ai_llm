@@ -1,778 +1,713 @@
 """
-JSON Storage Implementation.
-
-This module implements file-based storage using JSON files.
+JSON file-based storage implementation.
 """
 
+import asyncio
 import json
 import os
-import hashlib
-import aiofiles
-import asyncio
-import logging
-from typing import Dict, List, Any, Optional, Set, Tuple, Union
+import uuid
 from datetime import datetime
-import aiofiles.os as aio_os
-from filelock import FileLock
+from typing import Dict, List, Any, Optional, Set
 
 from .base import (
     BaseStorage,
+    StorageError,
     StorageConnectionError,
     ProductNotFoundError,
     DuplicateProductError,
 )
 
-logger = logging.getLogger(__name__)
-
 
 class JSONStorage(BaseStorage):
     """
-    JSON file-based storage for product data.
+    Storage implementation that uses JSON files.
     
-    This storage implementation saves each product as a separate JSON file
-    and maintains an index file for quick lookups and filtering.
-    
-    Attributes:
-        directory: Directory path where product data is stored.
-        index_file: Path to the index file.
-        lock_timeout: Timeout in seconds for acquiring file locks.
-        _index: In-memory cache of the product index.
-        _locks: Dictionary of file locks for concurrent access.
+    Each product is stored in its own JSON file, and an index file is used
+    for quick lookups and filtering.
     """
-    
-    def __init__(self, directory: str, lock_timeout: int = 30):
+
+    def __init__(self, directory: str, use_file_locks: bool = True):
         """
-        Initialize JSON storage.
+        Initialize the JSON storage.
         
         Args:
-            directory: Directory path where product data is stored.
-            lock_timeout: Timeout in seconds for acquiring file locks.
-            
+            directory: Path to the directory where product data will be stored.
+            use_file_locks: Whether to use file locks for concurrent operations.
+                            Set to False for better performance when concurrent
+                            access is not a concern.
+        
         Raises:
-            StorageConnectionError: If the directory cannot be created or is not writable.
+            StorageConnectionError: If the directory doesn't exist or can't be accessed.
         """
         self.directory = os.path.abspath(directory)
-        self.products_dir = os.path.join(self.directory, "products")
-        self.index_file = os.path.join(self.directory, "product_index.json")
-        self.index_lock_file = os.path.join(self.directory, "product_index.lock")
-        self.lock_timeout = lock_timeout
-        self._index: Dict[str, Dict[str, Any]] = {}
-        self._locks: Dict[str, FileLock] = {}
+        self.use_file_locks = use_file_locks
+        self.index_path = os.path.join(self.directory, "index.json")
+        self.lock = asyncio.Lock()
         
-        # Create directories if they don't exist
+        # Create the directory if it doesn't exist
         try:
-            os.makedirs(self.products_dir, exist_ok=True)
+            os.makedirs(self.directory, exist_ok=True)
         except (OSError, PermissionError) as e:
-            raise StorageConnectionError(f"Failed to create directories: {str(e)}")
-        
-        # Check if directories are writable
-        if not os.access(self.products_dir, os.W_OK):
-            raise StorageConnectionError(f"Directory is not writable: {self.products_dir}")
-    
+            raise StorageConnectionError(f"Failed to create directory: {e}")
+            
+        # Initialize the index file if it doesn't exist
+        if not os.path.exists(self.index_path):
+            try:
+                with open(self.index_path, "w") as f:
+                    json.dump({}, f)
+            except (OSError, PermissionError) as e:
+                raise StorageConnectionError(f"Failed to create index file: {e}")
+
     def _get_product_id(self, product_data: Dict[str, Any]) -> str:
         """
-        Generate a product ID based on product data.
+        Generate or retrieve a unique ID for a product.
         
-        If product_data contains an 'id' field, it will be used.
-        Otherwise, an ID will be generated based on:
-        1. 'sku' + 'seller_id'
-        2. 'mpn' + 'brand'
-        3. 'gtin' or 'upc' or 'ean'
-        4. 'url'
-        5. Hash of the product name and other identifiers
+        The ID is generated based on the following hierarchy:
+        1. If 'id' is present in the product data, use it.
+        2. Otherwise, generate an ID based on SKU + store name if available.
+        3. Otherwise, generate an ID based on URL if available.
+        4. Otherwise, generate a random UUID.
         
         Args:
-            product_data: Product data dictionary.
+            product_data: Dictionary containing product data.
             
         Returns:
-            str: Product ID.
+            str: A unique ID for the product.
         """
-        # If product already has an ID, use it
+        # If an ID is already provided, use it
         if "id" in product_data:
             return str(product_data["id"])
         
-        # Generate ID based on common product identifiers
-        identifiers = []
+        # Generate ID based on SKU + store name if available
+        if "sku" in product_data and "store_name" in product_data:
+            return f"{product_data['store_name']}_{product_data['sku']}"
         
-        # Option 1: SKU + Seller ID
-        if "sku" in product_data and "seller_id" in product_data:
-            return f"{product_data['seller_id']}_{product_data['sku']}"
+        # Generate ID based on URL if available
+        if "url" in product_data:
+            return f"url_{hash(product_data['url'])}"
         
-        # Option 2: MPN + Brand
-        if "mpn" in product_data and "brand" in product_data:
-            return f"{product_data['brand']}_{product_data['mpn']}"
-        
-        # Option 3: GTIN, UPC, or EAN
-        for id_type in ["gtin", "upc", "ean"]:
-            if id_type in product_data and product_data[id_type]:
-                return f"{id_type}_{product_data[id_type]}"
-        
-        # Option 4: URL
-        if "url" in product_data and product_data["url"]:
-            url_hash = hashlib.md5(product_data["url"].encode()).hexdigest()
-            return f"url_{url_hash}"
-        
-        # Option 5: Product name and metadata hash
-        hash_data = {"name": product_data.get("name", "")}
-        
-        for field in ["brand", "category", "model"]:
-            if field in product_data:
-                hash_data[field] = product_data[field]
-        
-        hash_str = json.dumps(hash_data, sort_keys=True)
-        hash_digest = hashlib.md5(hash_str.encode()).hexdigest()
-        
-        return f"product_{hash_digest}"
-    
+        # Generate a random UUID as a last resort
+        return str(uuid.uuid4())
+
     def _get_file_path(self, product_id: str) -> str:
         """
         Get the file path for a product.
         
         Args:
-            product_id: Product ID.
+            product_id: The ID of the product.
             
         Returns:
-            str: File path.
+            str: The file path for the product.
         """
-        # Create a directory structure based on the first characters of the product ID
-        # This helps to avoid having too many files in a single directory
-        dir_prefix = product_id[:2]
-        subdir = os.path.join(self.products_dir, dir_prefix)
-        os.makedirs(subdir, exist_ok=True)
-        
-        return os.path.join(subdir, f"{product_id}.json")
-    
-    def _get_lock(self, file_path: str) -> FileLock:
-        """
-        Get a file lock for the given file path.
-        
-        Args:
-            file_path: File path to lock.
-            
-        Returns:
-            FileLock: The file lock.
-        """
-        if file_path not in self._locks:
-            lock_file = f"{file_path}.lock"
-            self._locks[file_path] = FileLock(lock_file, timeout=self.lock_timeout)
-        
-        return self._locks[file_path]
-    
+        return os.path.join(self.directory, f"{product_id}.json")
+
     async def _load_index(self) -> Dict[str, Dict[str, Any]]:
         """
         Load the product index from the index file.
         
         Returns:
-            Dict[str, Dict[str, Any]]: Product index.
-            
-        Raises:
-            StorageConnectionError: If the index file cannot be read.
-        """
-        index_lock = self._get_lock(self.index_file)
+            Dict[str, Dict[str, Any]]: The product index.
         
+        Raises:
+            StorageConnectionError: If the index file can't be loaded.
+        """
         try:
-            with index_lock:
-                if os.path.exists(self.index_file):
-                    try:
-                        async with aiofiles.open(self.index_file, "r") as f:
-                            content = await f.read()
-                            return json.loads(content) if content else {}
-                    except (IOError, json.JSONDecodeError) as e:
-                        logger.warning(f"Failed to read index file: {str(e)}")
-                        return {}
-                else:
-                    return {}
-        except TimeoutError:
-            raise StorageConnectionError("Timeout acquiring index file lock")
-    
+            if self.use_file_locks:
+                async with self.lock:
+                    # Use blocking file I/O in a thread pool
+                    loop = asyncio.get_event_loop()
+                    return await loop.run_in_executor(
+                        None, 
+                        lambda: json.load(open(self.index_path, "r")) 
+                              if os.path.exists(self.index_path) and os.path.getsize(self.index_path) > 0 
+                              else {}
+                    )
+            else:
+                # Use blocking file I/O in a thread pool
+                loop = asyncio.get_event_loop()
+                return await loop.run_in_executor(
+                    None, 
+                    lambda: json.load(open(self.index_path, "r")) 
+                          if os.path.exists(self.index_path) and os.path.getsize(self.index_path) > 0 
+                          else {}
+                )
+        except json.JSONDecodeError:
+            # If the index file is corrupted, return an empty index
+            return {}
+        except (OSError, PermissionError) as e:
+            raise StorageConnectionError(f"Failed to load index: {e}")
+
     async def _save_index(self, index: Dict[str, Dict[str, Any]]) -> None:
         """
         Save the product index to the index file.
         
         Args:
-            index: Product index.
-            
-        Raises:
-            StorageConnectionError: If the index file cannot be written.
-        """
-        index_lock = self._get_lock(self.index_file)
+            index: The product index to save.
         
+        Raises:
+            StorageConnectionError: If the index file can't be saved.
+        """
         try:
-            with index_lock:
-                try:
-                    async with aiofiles.open(self.index_file, "w") as f:
-                        await f.write(json.dumps(index, indent=2))
-                except IOError as e:
-                    raise StorageConnectionError(f"Failed to write index file: {str(e)}")
-        except TimeoutError:
-            raise StorageConnectionError("Timeout acquiring index file lock")
-    
+            if self.use_file_locks:
+                async with self.lock:
+                    # Use blocking file I/O in a thread pool
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(
+                        None, 
+                        lambda: json.dump(index, open(self.index_path, "w"))
+                    )
+            else:
+                # Use blocking file I/O in a thread pool
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(
+                    None, 
+                    lambda: json.dump(index, open(self.index_path, "w"))
+                )
+        except (OSError, PermissionError) as e:
+            raise StorageConnectionError(f"Failed to save index: {e}")
+
     async def save_product(self, product_data: Dict[str, Any]) -> str:
         """
         Save a product to storage.
         
         Args:
-            product_data: Product data dictionary.
-            
+            product_data: Dictionary containing product data.
+        
         Returns:
-            str: Product ID.
-            
+            str: The ID of the saved product.
+        
         Raises:
             DuplicateProductError: If a product with the same ID already exists.
-            StorageConnectionError: If the product cannot be saved.
+            StorageConnectionError: If there's an error connecting to the storage.
         """
-        # Generate product ID
+        # Generate a unique ID for the product
         product_id = self._get_product_id(product_data)
         
-        # Check if product already exists
-        index = await self._load_index()
-        if product_id in index:
-            raise DuplicateProductError(f"Product with ID {product_id} already exists")
-        
-        # Add product metadata to index
-        metadata = {
-            "id": product_id,
-            "created_at": datetime.now().isoformat(),
-            "updated_at": datetime.now().isoformat(),
-        }
-        
-        # Add relevant fields to metadata for searching and filtering
-        for field in ["name", "brand", "category", "price", "currency", "url", "sku", "seller_id"]:
-            if field in product_data:
-                metadata[field] = product_data[field]
-        
-        # Add product ID to the product data
+        # Add the ID to the product data
         product_data["id"] = product_id
         
-        # Save product data to file
+        # Add metadata
+        product_data["metadata"] = product_data.get("metadata", {})
+        product_data["metadata"]["created_at"] = datetime.now().isoformat()
+        product_data["metadata"]["updated_at"] = datetime.now().isoformat()
+        
+        # Check if the product already exists
+        index = await self._load_index()
+        if product_id in index:
+            raise DuplicateProductError(f"Product with ID '{product_id}' already exists")
+        
+        # Save the product to a file
         file_path = self._get_file_path(product_id)
-        file_lock = self._get_lock(file_path)
-        
         try:
-            with file_lock:
-                try:
-                    async with aiofiles.open(file_path, "w") as f:
-                        await f.write(json.dumps(product_data, indent=2))
-                except IOError as e:
-                    raise StorageConnectionError(f"Failed to write product file: {str(e)}")
-        except TimeoutError:
-            raise StorageConnectionError("Timeout acquiring product file lock")
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None, 
+                lambda: json.dump(product_data, open(file_path, "w"))
+            )
+        except (OSError, PermissionError) as e:
+            raise StorageConnectionError(f"Failed to save product: {e}")
         
-        # Update index
-        index[product_id] = metadata
+        # Update the index
+        index[product_id] = {
+            "id": product_id,
+            "metadata": product_data["metadata"],
+        }
+        
+        # Add key fields to the index for filtering
+        for field in ["sku", "url", "store_name", "title"]:
+            if field in product_data:
+                index[product_id][field] = product_data[field]
+        
         await self._save_index(index)
         
         return product_id
-    
+
     async def save_products(self, products_data: List[Dict[str, Any]]) -> List[str]:
         """
-        Save multiple products to the storage in a batch operation.
+        Save multiple products to storage in a batch operation.
         
         Args:
-            products_data: A list of dictionaries containing product data.
-            
+            products_data: List of dictionaries containing product data.
+        
         Returns:
-            List[str]: The IDs of the saved products.
-            
+            List[str]: The IDs of the saved products, in the same order as the input.
+        
         Raises:
-            DuplicateProductError: If any product with the same ID already exists.
-            StorageConnectionError: If a connection to the storage cannot be established.
+            DuplicateProductError: If a product with the same ID already exists.
+            StorageConnectionError: If there's an error connecting to the storage.
         """
         if not products_data:
             return []
-        
-        # Load the current index
-        index = await self._load_index()
-        
-        # Generate product IDs and check for duplicates
-        products_with_ids = []
+            
+        # Generate unique IDs for all products and check for duplicates
         product_ids = []
-        new_index_entries = {}
+        index = await self._load_index()
+        existing_ids = set(index.keys())
+        
+        # Prepare products with IDs and metadata
+        prepared_products = []
         
         for product_data in products_data:
             product_id = self._get_product_id(product_data)
             
-            if product_id in index:
-                raise DuplicateProductError(f"Product with ID {product_id} already exists")
+            if product_id in existing_ids:
+                raise DuplicateProductError(f"Product with ID '{product_id}' already exists")
+                
+            # Add the ID to the product data
+            product_data_copy = product_data.copy()
+            product_data_copy["id"] = product_id
             
-            # Add product ID to the product data
-            product_data["id"] = product_id
-            products_with_ids.append(product_data)
+            # Add metadata
+            product_data_copy["metadata"] = product_data_copy.get("metadata", {})
+            product_data_copy["metadata"]["created_at"] = datetime.now().isoformat()
+            product_data_copy["metadata"]["updated_at"] = datetime.now().isoformat()
+            
             product_ids.append(product_id)
+            prepared_products.append(product_data_copy)
             
-            # Create metadata for index
-            metadata = {
+            # Update the index entry
+            index[product_id] = {
                 "id": product_id,
-                "created_at": datetime.now().isoformat(),
-                "updated_at": datetime.now().isoformat(),
+                "metadata": product_data_copy["metadata"],
             }
             
-            # Add relevant fields to metadata for searching and filtering
-            for field in ["name", "brand", "category", "price", "currency", "url", "sku", "seller_id"]:
-                if field in product_data:
-                    metadata[field] = product_data[field]
+            # Add key fields to the index for filtering
+            for field in ["sku", "url", "store_name", "title"]:
+                if field in product_data_copy:
+                    index[product_id][field] = product_data_copy[field]
+        
+        # Save all products to files
+        try:
+            loop = asyncio.get_event_loop()
+            tasks = []
             
-            new_index_entries[product_id] = metadata
+            for product_id, product_data in zip(product_ids, prepared_products):
+                file_path = self._get_file_path(product_id)
+                tasks.append(loop.run_in_executor(
+                    None,
+                    lambda p=product_data, f=file_path: json.dump(p, open(f, "w"))
+                ))
+                
+            await asyncio.gather(*tasks)
+        except (OSError, PermissionError) as e:
+            raise StorageConnectionError(f"Failed to save products: {e}")
         
-        # Save all products in parallel
-        tasks = []
-        for product_data in products_with_ids:
-            tasks.append(self._save_product_file(product_data))
-        
-        await asyncio.gather(*tasks)
-        
-        # Update index with all new products
-        index.update(new_index_entries)
+        # Update the index with all new products
         await self._save_index(index)
         
         return product_ids
-    
-    async def _save_product_file(self, product_data: Dict[str, Any]) -> None:
-        """
-        Save a product to a file without updating the index.
-        
-        Args:
-            product_data: Product data dictionary.
-            
-        Raises:
-            StorageConnectionError: If the product cannot be saved.
-        """
-        product_id = product_data["id"]
-        file_path = self._get_file_path(product_id)
-        file_lock = self._get_lock(file_path)
-        
-        try:
-            with file_lock:
-                try:
-                    async with aiofiles.open(file_path, "w") as f:
-                        await f.write(json.dumps(product_data, indent=2))
-                except IOError as e:
-                    raise StorageConnectionError(f"Failed to write product file: {str(e)}")
-        except TimeoutError:
-            raise StorageConnectionError("Timeout acquiring product file lock")
-    
+
     async def get_product(self, product_id: str) -> Dict[str, Any]:
         """
-        Get a product from storage.
+        Retrieve a product from storage by ID.
         
         Args:
-            product_id: Product ID.
-            
+            product_id: The ID of the product to retrieve.
+        
         Returns:
-            Dict[str, Any]: Product data.
-            
+            Dict[str, Any]: The product data.
+        
         Raises:
             ProductNotFoundError: If the product is not found.
-            StorageConnectionError: If the product cannot be retrieved.
+            StorageConnectionError: If there's an error connecting to the storage.
         """
-        # Check if product exists in index
-        index = await self._load_index()
-        if product_id not in index:
-            # Try to load the product directly from file as a fallback
-            file_path = self._get_file_path(product_id)
-            if not await aio_os.path.exists(file_path):
-                raise ProductNotFoundError(f"Product with ID {product_id} not found")
-        
-        # Get product data from file
         file_path = self._get_file_path(product_id)
-        file_lock = self._get_lock(file_path)
         
         try:
-            with file_lock:
-                try:
-                    if not await aio_os.path.exists(file_path):
-                        raise ProductNotFoundError(f"Product with ID {product_id} not found")
-                    
-                    async with aiofiles.open(file_path, "r") as f:
-                        content = await f.read()
-                        return json.loads(content)
-                except (IOError, json.JSONDecodeError) as e:
-                    raise StorageConnectionError(f"Failed to read product file: {str(e)}")
-        except TimeoutError:
-            raise StorageConnectionError("Timeout acquiring product file lock")
-    
+            if not os.path.exists(file_path):
+                raise ProductNotFoundError(f"Product with ID '{product_id}' not found")
+                
+            loop = asyncio.get_event_loop()
+            product_data = await loop.run_in_executor(
+                None, 
+                lambda: json.load(open(file_path, "r"))
+            )
+            
+            return product_data
+        except json.JSONDecodeError as e:
+            raise StorageError(f"Invalid JSON in product file: {e}")
+        except (OSError, PermissionError) as e:
+            raise StorageConnectionError(f"Failed to retrieve product: {e}")
+
     async def get_products(self, product_ids: List[str]) -> List[Dict[str, Any]]:
         """
-        Get multiple products from the storage by their IDs in a batch operation.
+        Retrieve multiple products from storage by their IDs in a batch operation.
         
         Args:
-            product_ids: A list of product IDs to retrieve.
-            
+            product_ids: List of product IDs to retrieve.
+        
         Returns:
-            List[Dict[str, Any]]: The product data for each found product.
-            
+            List[Dict[str, Any]]: The product data for each requested ID, in the same order.
+        
         Raises:
             ProductNotFoundError: If any of the products are not found.
-            StorageConnectionError: If a connection to the storage cannot be established.
+            StorageConnectionError: If there's an error connecting to the storage.
         """
         if not product_ids:
             return []
+            
+        # Check which products exist
+        missing_ids = []
+        file_paths = {}
         
-        # Load products in parallel
-        tasks = []
         for product_id in product_ids:
-            tasks.append(self.get_product(product_id))
-        
-        return await asyncio.gather(*tasks)
-    
-    async def update_product(self, product_id: str, product_data: Dict[str, Any]) -> str:
+            file_path = self._get_file_path(product_id)
+            if not os.path.exists(file_path):
+                missing_ids.append(product_id)
+            else:
+                file_paths[product_id] = file_path
+                
+        if missing_ids:
+            raise ProductNotFoundError(f"Products with IDs '{', '.join(missing_ids)}' not found")
+            
+        # Retrieve all products in parallel
+        try:
+            loop = asyncio.get_event_loop()
+            tasks = []
+            
+            for product_id in product_ids:
+                file_path = file_paths[product_id]
+                tasks.append(loop.run_in_executor(
+                    None,
+                    lambda f=file_path: json.load(open(f, "r"))
+                ))
+                
+            return await asyncio.gather(*tasks)
+        except json.JSONDecodeError as e:
+            raise StorageError(f"Invalid JSON in product file: {e}")
+        except (OSError, PermissionError) as e:
+            raise StorageConnectionError(f"Failed to retrieve products: {e}")
+
+    async def update_product(self, product_data: Dict[str, Any]) -> str:
         """
-        Update a product in storage.
+        Update an existing product in storage.
         
         Args:
-            product_id: Product ID.
-            product_data: Updated product data.
-            
+            product_data: Dictionary containing product data. Must include 'id' field.
+        
         Returns:
-            str: Product ID.
-            
+            str: The ID of the updated product.
+        
         Raises:
             ProductNotFoundError: If the product is not found.
-            StorageConnectionError: If the product cannot be updated.
+            ValueError: If the product_data doesn't contain an 'id' field.
+            StorageConnectionError: If there's an error connecting to the storage.
         """
-        # Check if product exists
+        if "id" not in product_data:
+            raise ValueError("Product data must include 'id' field")
+            
+        product_id = str(product_data["id"])
         index = await self._load_index()
+        
         if product_id not in index:
-            # Try to load the product directly from file as a fallback
-            file_path = self._get_file_path(product_id)
-            if not await aio_os.path.exists(file_path):
-                raise ProductNotFoundError(f"Product with ID {product_id} not found")
+            raise ProductNotFoundError(f"Product with ID '{product_id}' not found")
+            
+        # Get the existing product to merge with the updates
+        existing_product = await self.get_product(product_id)
         
-        # Ensure the product ID is not changed
-        product_data["id"] = product_id
+        # Update the product data
+        updated_product = {**existing_product, **product_data}
         
-        # Update product metadata in index
-        metadata = index.get(product_id, {})
-        metadata["updated_at"] = datetime.now().isoformat()
+        # Update metadata
+        updated_product["metadata"] = updated_product.get("metadata", {})
+        updated_product["metadata"]["updated_at"] = datetime.now().isoformat()
         
-        # Update relevant fields in metadata for searching and filtering
-        for field in ["name", "brand", "category", "price", "currency", "url", "sku", "seller_id"]:
-            if field in product_data:
-                metadata[field] = product_data[field]
-        
-        # Save updated product data to file
+        # Save the updated product
         file_path = self._get_file_path(product_id)
-        file_lock = self._get_lock(file_path)
-        
         try:
-            with file_lock:
-                try:
-                    async with aiofiles.open(file_path, "w") as f:
-                        await f.write(json.dumps(product_data, indent=2))
-                except IOError as e:
-                    raise StorageConnectionError(f"Failed to write product file: {str(e)}")
-        except TimeoutError:
-            raise StorageConnectionError("Timeout acquiring product file lock")
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None, 
+                lambda: json.dump(updated_product, open(file_path, "w"))
+            )
+        except (OSError, PermissionError) as e:
+            raise StorageConnectionError(f"Failed to update product: {e}")
         
-        # Update index
-        index[product_id] = metadata
+        # Update the index
+        index[product_id] = {
+            "id": product_id,
+            "metadata": updated_product["metadata"],
+        }
+        
+        # Add key fields to the index for filtering
+        for field in ["sku", "url", "store_name", "title"]:
+            if field in updated_product:
+                index[product_id][field] = updated_product[field]
+        
         await self._save_index(index)
         
         return product_id
-    
-    async def update_products(self, products: List[Dict[str, Any]]) -> List[str]:
+
+    async def update_products(self, products_data: List[Dict[str, Any]]) -> List[str]:
         """
-        Update multiple products in the storage in a batch operation.
+        Update multiple existing products in storage in a batch operation.
         
         Args:
-            products: A list of dictionaries containing updated product data with their IDs.
-                     Each dictionary should include a product_id key.
-            
+            products_data: List of dictionaries containing product data. Each must include 'id' field.
+        
         Returns:
-            List[str]: The IDs of the updated products.
-            
+            List[str]: The IDs of the updated products, in the same order as the input.
+        
         Raises:
             ProductNotFoundError: If any of the products are not found.
-            StorageConnectionError: If a connection to the storage cannot be established.
+            ValueError: If any product_data doesn't contain an 'id' field.
+            StorageConnectionError: If there's an error connecting to the storage.
         """
-        if not products:
+        if not products_data:
             return []
-        
-        # Load the current index
-        index = await self._load_index()
-        
-        # Verify all products exist and prepare updates
-        products_to_update = []
+            
+        # Verify all products have IDs and collect IDs to update
         product_ids = []
-        index_updates = {}
-        
-        for product_data in products:
+        for i, product_data in enumerate(products_data):
             if "id" not in product_data:
-                raise ValueError("Each product must include an 'id' field")
+                raise ValueError(f"Product data at index {i} must include 'id' field")
+            product_ids.append(str(product_data["id"]))
             
-            product_id = product_data["id"]
-            product_ids.append(product_id)
+        # Check which products exist
+        index = await self._load_index()
+        missing_ids = [pid for pid in product_ids if pid not in index]
+        
+        if missing_ids:
+            raise ProductNotFoundError(f"Products with IDs '{', '.join(missing_ids)}' not found")
             
-            # Check if product exists in index or file
-            if product_id not in index:
+        # Get all existing products to merge with updates
+        existing_products = await self.get_products(product_ids)
+        
+        # Prepare updates
+        updates = []
+        now = datetime.now().isoformat()
+        
+        for i, (product_id, product_data, existing_product) in enumerate(
+            zip(product_ids, products_data, existing_products)
+        ):
+            # Update the product data
+            updated_product = {**existing_product, **product_data}
+            
+            # Update metadata
+            updated_product["metadata"] = updated_product.get("metadata", {})
+            updated_product["metadata"]["updated_at"] = now
+            
+            updates.append(updated_product)
+            
+            # Update the index
+            index[product_id] = {
+                "id": product_id,
+                "metadata": updated_product["metadata"],
+            }
+            
+            # Add key fields to the index for filtering
+            for field in ["sku", "url", "store_name", "title"]:
+                if field in updated_product:
+                    index[product_id][field] = updated_product[field]
+        
+        # Save all updated products to files
+        try:
+            loop = asyncio.get_event_loop()
+            tasks = []
+            
+            for product_id, updated_product in zip(product_ids, updates):
                 file_path = self._get_file_path(product_id)
-                if not await aio_os.path.exists(file_path):
-                    raise ProductNotFoundError(f"Product with ID {product_id} not found")
-            
-            # Ensure the product ID is not changed
-            product_data["id"] = product_id
-            products_to_update.append(product_data)
-            
-            # Update metadata in index
-            metadata = index.get(product_id, {})
-            metadata["updated_at"] = datetime.now().isoformat()
-            
-            # Update relevant fields in metadata for searching and filtering
-            for field in ["name", "brand", "category", "price", "currency", "url", "sku", "seller_id"]:
-                if field in product_data:
-                    metadata[field] = product_data[field]
-            
-            index_updates[product_id] = metadata
+                tasks.append(loop.run_in_executor(
+                    None,
+                    lambda p=updated_product, f=file_path: json.dump(p, open(f, "w"))
+                ))
+                
+            await asyncio.gather(*tasks)
+        except (OSError, PermissionError) as e:
+            raise StorageConnectionError(f"Failed to update products: {e}")
         
-        # Save all products in parallel
-        tasks = []
-        for product_data in products_to_update:
-            tasks.append(self._save_product_file(product_data))
-        
-        await asyncio.gather(*tasks)
-        
-        # Update index with all updated products
-        index.update(index_updates)
+        # Update the index with all updated products
         await self._save_index(index)
         
         return product_ids
-    
+
     async def delete_product(self, product_id: str) -> bool:
         """
-        Delete a product from storage.
+        Delete a product from storage by ID.
         
         Args:
-            product_id: Product ID.
-            
+            product_id: The ID of the product to delete.
+        
         Returns:
             bool: True if the product was deleted, False otherwise.
-            
+        
         Raises:
             ProductNotFoundError: If the product is not found.
-            StorageConnectionError: If the product cannot be deleted.
+            StorageConnectionError: If there's an error connecting to the storage.
         """
-        # Check if product exists
         index = await self._load_index()
+        
+        if product_id not in index:
+            raise ProductNotFoundError(f"Product with ID '{product_id}' not found")
+            
+        # Remove the product file
         file_path = self._get_file_path(product_id)
-        
-        if product_id not in index and not await aio_os.path.exists(file_path):
-            raise ProductNotFoundError(f"Product with ID {product_id} not found")
-        
-        # Delete product file
-        file_lock = self._get_lock(file_path)
-        
         try:
-            with file_lock:
-                try:
-                    if await aio_os.path.exists(file_path):
-                        await aio_os.unlink(file_path)
-                except IOError as e:
-                    raise StorageConnectionError(f"Failed to delete product file: {str(e)}")
-        except TimeoutError:
-            raise StorageConnectionError("Timeout acquiring product file lock")
+            if os.path.exists(file_path):
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, os.remove, file_path)
+        except (OSError, PermissionError) as e:
+            raise StorageConnectionError(f"Failed to delete product: {e}")
         
-        # Remove product from index
-        if product_id in index:
-            del index[product_id]
-            await self._save_index(index)
+        # Update the index
+        del index[product_id]
+        await self._save_index(index)
         
         return True
-    
+
     async def delete_products(self, product_ids: List[str]) -> int:
         """
-        Delete multiple products from the storage in a batch operation.
+        Delete multiple products from storage by their IDs in a batch operation.
         
         Args:
-            product_ids: A list of product IDs to delete.
-            
+            product_ids: List of product IDs to delete.
+        
         Returns:
-            int: The number of products deleted.
-            
+            int: The number of products that were deleted.
+        
         Raises:
             ProductNotFoundError: If any of the products are not found.
-            StorageConnectionError: If a connection to the storage cannot be established.
+            StorageConnectionError: If there's an error connecting to the storage.
         """
         if not product_ids:
             return 0
-        
-        # Load the current index
+            
         index = await self._load_index()
         
-        # Verify all products exist
-        missing_products = []
+        # Check which products exist
+        missing_ids = [pid for pid in product_ids if pid not in index]
+        
+        if missing_ids:
+            raise ProductNotFoundError(f"Products with IDs '{', '.join(missing_ids)}' not found")
+            
+        # Remove all product files in parallel
+        try:
+            loop = asyncio.get_event_loop()
+            tasks = []
+            
+            for product_id in product_ids:
+                file_path = self._get_file_path(product_id)
+                if os.path.exists(file_path):
+                    tasks.append(loop.run_in_executor(
+                        None,
+                        os.remove,
+                        file_path
+                    ))
+                    
+            await asyncio.gather(*tasks)
+        except (OSError, PermissionError) as e:
+            raise StorageConnectionError(f"Failed to delete products: {e}")
+        
+        # Update the index
         for product_id in product_ids:
-            file_path = self._get_file_path(product_id)
-            if product_id not in index and not await aio_os.path.exists(file_path):
-                missing_products.append(product_id)
-        
-        if missing_products:
-            raise ProductNotFoundError(f"Products not found: {', '.join(missing_products)}")
-        
-        # Delete all product files in parallel
-        tasks = []
-        for product_id in product_ids:
-            tasks.append(self._delete_product_file(product_id))
-        
-        await asyncio.gather(*tasks)
-        
-        # Remove products from index
-        updated = False
-        for product_id in product_ids:
-            if product_id in index:
-                del index[product_id]
-                updated = True
-        
-        if updated:
-            await self._save_index(index)
+            del index[product_id]
+            
+        await self._save_index(index)
         
         return len(product_ids)
-    
-    async def _delete_product_file(self, product_id: str) -> None:
-        """
-        Delete a product file without updating the index.
-        
-        Args:
-            product_id: Product ID.
-            
-        Raises:
-            StorageConnectionError: If the product cannot be deleted.
-        """
-        file_path = self._get_file_path(product_id)
-        file_lock = self._get_lock(file_path)
-        
-        try:
-            with file_lock:
-                try:
-                    if await aio_os.path.exists(file_path):
-                        await aio_os.unlink(file_path)
-                except IOError as e:
-                    raise StorageConnectionError(f"Failed to delete product file: {str(e)}")
-        except TimeoutError:
-            raise StorageConnectionError("Timeout acquiring product file lock")
-    
+
     async def list_products(
         self,
         filters: Optional[Dict[str, Any]] = None,
         page: int = 1,
-        page_size: int = 50,
+        page_size: int = 100,
         sort_by: Optional[str] = None,
-        sort_order: str = "asc"
+        sort_order: str = "asc",
     ) -> Dict[str, Any]:
         """
-        List products with optional filtering, pagination and sorting.
+        List products with optional filtering, pagination, and sorting.
         
         Args:
-            filters: Optional dictionary of field:value to filter products.
-            page: Page number (1-indexed).
-            page_size: Number of items per page.
-            sort_by: Field to sort by.
+            filters: Dictionary of field-value pairs to filter products by.
+            page: Page number, starting from 1.
+            page_size: Number of products per page.
+            sort_by: Field to sort products by.
             sort_order: Sort order, either "asc" or "desc".
-            
+        
         Returns:
             Dict[str, Any]: Dictionary containing:
-                - items: List of products
-                - total: Total number of products matching the filters
-                - page: Current page number
-                - page_size: Number of items per page
-                - total_pages: Total number of pages
-            
+                - 'products': List of product data.
+                - 'total': Total number of products matching the filters.
+                - 'page': Current page number.
+                - 'page_size': Number of products per page.
+                - 'total_pages': Total number of pages.
+        
         Raises:
-            StorageConnectionError: If the products cannot be listed.
+            StorageConnectionError: If there's an error connecting to the storage.
         """
-        # Load index
+        # Load the index
         index = await self._load_index()
         
-        # Apply filters
-        filtered_products = []
-        for product_id, metadata in index.items():
-            if filters and not self._matches_filters(metadata, filters):
+        # Filter the products
+        filtered_product_ids = []
+        for product_id, product_metadata in index.items():
+            if filters and not self._matches_filters(product_metadata, filters):
                 continue
-            
-            filtered_products.append(metadata)
+            filtered_product_ids.append(product_id)
         
-        # Apply sorting
+        # Sort the products
         if sort_by:
-            reverse = sort_order.lower() == "desc"
-            filtered_products.sort(
-                key=lambda p: p.get(sort_by, ""),
-                reverse=reverse
+            def sort_key(product_id):
+                if sort_by == "id":
+                    return product_id
+                elif sort_by.startswith("metadata."):
+                    meta_field = sort_by.split(".", 1)[1]
+                    metadata = index.get(product_id, {}).get("metadata", {})
+                    return metadata.get(meta_field, "")
+                else:
+                    return index.get(product_id, {}).get(sort_by, "")
+                
+            filtered_product_ids = sorted(
+                filtered_product_ids,
+                key=sort_key,
+                reverse=(sort_order.lower() == "desc")
             )
         
-        # Apply pagination
-        total = len(filtered_products)
-        total_pages = (total + page_size - 1) // page_size
-        
+        # Paginate the products
+        total = len(filtered_product_ids)
+        total_pages = (total + page_size - 1) // page_size if total > 0 else 1
         start_idx = (page - 1) * page_size
         end_idx = min(start_idx + page_size, total)
         
-        page_products = filtered_products[start_idx:end_idx]
+        paginated_product_ids = filtered_product_ids[start_idx:end_idx]
         
-        # Load full product data for the page
-        product_ids = [p["id"] for p in page_products]
-        
-        product_tasks = []
-        for product_id in product_ids:
-            product_tasks.append(self.get_product(product_id))
-        
-        try:
-            items = await asyncio.gather(*product_tasks)
-        except ProductNotFoundError:
-            # Handle case where a product was deleted after loading the index
-            # Refresh the index and try again
-            new_index = await self._load_index()
-            # Only keep products that still exist
-            product_ids = [pid for pid in product_ids if pid in new_index]
-            
-            product_tasks = []
-            for product_id in product_ids:
-                product_tasks.append(self.get_product(product_id))
-            
-            items = await asyncio.gather(*product_tasks)
+        # Get the product data for the paginated IDs
+        products = []
+        if paginated_product_ids:
+            try:
+                products = await self.get_products(paginated_product_ids)
+            except ProductNotFoundError:
+                # This should not happen because we've already checked that the products exist
+                # But just in case, we'll handle it gracefully
+                products = []
         
         return {
-            "items": items,
+            "products": products,
             "total": total,
             "page": page,
             "page_size": page_size,
-            "total_pages": total_pages
+            "total_pages": total_pages,
         }
-    
-    def _matches_filters(self, metadata: Dict[str, Any], filters: Dict[str, Any]) -> bool:
+
+    def _matches_filters(self, product_metadata: Dict[str, Any], filters: Dict[str, Any]) -> bool:
         """
         Check if a product's metadata matches the given filters.
         
         Args:
-            metadata: Product metadata.
-            filters: Filters to apply.
-            
+            product_metadata: Dictionary containing product metadata.
+            filters: Dictionary of field-value pairs to filter products by.
+        
         Returns:
-            bool: True if the product matches all filters, False otherwise.
+            bool: True if the product matches the filters, False otherwise.
         """
         for field, value in filters.items():
-            # Handle special filter operations
-            if isinstance(value, dict):
-                for op, op_value in value.items():
-                    if op == "eq" and metadata.get(field) != op_value:
-                        return False
-                    elif op == "neq" and metadata.get(field) == op_value:
-                        return False
-                    elif op == "gt" and (field not in metadata or metadata[field] <= op_value):
-                        return False
-                    elif op == "gte" and (field not in metadata or metadata[field] < op_value):
-                        return False
-                    elif op == "lt" and (field not in metadata or metadata[field] >= op_value):
-                        return False
-                    elif op == "lte" and (field not in metadata or metadata[field] > op_value):
-                        return False
-                    elif op == "in" and (field not in metadata or metadata[field] not in op_value):
-                        return False
-                    elif op == "nin" and (field in metadata and metadata[field] in op_value):
-                        return False
-                    elif op == "contains" and (field not in metadata or op_value not in str(metadata[field])):
-                        return False
-            else:
-                # Simple equality check
-                if field not in metadata or metadata[field] != value:
+            if field.startswith("metadata."):
+                # Filter by metadata field
+                meta_field = field.split(".", 1)[1]
+                metadata = product_metadata.get("metadata", {})
+                if meta_field not in metadata or metadata[meta_field] != value:
                     return False
-        
+            elif field not in product_metadata or product_metadata[field] != value:
+                return False
+                
         return True
