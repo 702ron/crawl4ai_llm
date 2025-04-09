@@ -1,201 +1,202 @@
 """
-Base interface and exceptions for storage implementations.
+Base Storage Interface.
+
+This module defines the base interface for storage implementations.
 """
 
-from abc import ABC, abstractmethod
-from typing import Dict, List, Tuple, Any, Optional, Union
-
-from ..models import ProductData
+import abc
+from typing import Dict, List, Any, Optional, Union
 
 
 class StorageError(Exception):
-    """Base class for storage-related exceptions."""
-    pass
-
-
-class ProductNotFoundError(StorageError):
-    """Raised when a product is not found in storage."""
-    pass
-
-
-class DuplicateProductError(StorageError):
-    """Raised when attempting to save a product that already exists."""
+    """Base exception for all storage-related errors."""
     pass
 
 
 class StorageConnectionError(StorageError):
-    """Raised when there's an error connecting to the storage system."""
+    """Exception raised when a connection to the storage cannot be established."""
     pass
 
 
-class BaseStorage(ABC):
-    """
-    Base storage interface for product data.
+class ProductNotFoundError(StorageError):
+    """Exception raised when a product is not found in the storage."""
+    pass
+
+
+class DuplicateProductError(StorageError):
+    """Exception raised when attempting to save a product that already exists."""
+    pass
+
+
+class BaseStorage(abc.ABC):
+    """Base storage interface for saving and retrieving product data."""
     
-    All storage implementations must implement these methods.
-    """
-    
-    @abstractmethod
-    async def save_product(self, product: ProductData) -> str:
+    @abc.abstractmethod
+    async def save_product(self, product_data: Dict[str, Any]) -> str:
         """
-        Save a single product to storage.
+        Save a product to the storage.
         
         Args:
-            product: The product data to save.
+            product_data: A dictionary containing product data.
             
         Returns:
             str: The ID of the saved product.
             
         Raises:
-            DuplicateProductError: If the product already exists.
-            StorageConnectionError: If there's an error connecting to storage.
+            DuplicateProductError: If a product with the same ID already exists.
+            StorageConnectionError: If a connection to the storage cannot be established.
         """
         pass
     
-    @abstractmethod
-    async def save_products(self, products: List[ProductData]) -> List[str]:
+    @abc.abstractmethod
+    async def save_products(self, products_data: List[Dict[str, Any]]) -> List[str]:
         """
-        Save multiple products to storage in batch.
+        Save multiple products to the storage in a batch operation.
         
         Args:
-            products: List of product data to save.
+            products_data: A list of dictionaries containing product data.
             
         Returns:
             List[str]: The IDs of the saved products.
             
         Raises:
-            DuplicateProductError: If any product already exists.
-            StorageConnectionError: If there's an error connecting to storage.
+            DuplicateProductError: If any product with the same ID already exists.
+            StorageConnectionError: If a connection to the storage cannot be established.
         """
         pass
     
-    @abstractmethod
-    async def get_product(self, product_id: str) -> ProductData:
+    @abc.abstractmethod
+    async def get_product(self, product_id: str) -> Dict[str, Any]:
         """
-        Retrieve a product by ID.
+        Get a product from the storage by its ID.
         
         Args:
             product_id: The ID of the product to retrieve.
             
         Returns:
-            ProductData: The product data.
+            Dict[str, Any]: The product data.
             
         Raises:
-            ProductNotFoundError: If the product doesn't exist.
-            StorageConnectionError: If there's an error connecting to storage.
+            ProductNotFoundError: If the product is not found.
+            StorageConnectionError: If a connection to the storage cannot be established.
         """
         pass
     
-    @abstractmethod
-    async def get_products(self, product_ids: List[str]) -> List[ProductData]:
+    @abc.abstractmethod
+    async def get_products(self, product_ids: List[str]) -> List[Dict[str, Any]]:
         """
-        Retrieve multiple products by their IDs.
+        Get multiple products from the storage by their IDs in a batch operation.
         
         Args:
-            product_ids: List of product IDs to retrieve.
+            product_ids: A list of product IDs to retrieve.
             
         Returns:
-            List[ProductData]: The retrieved products.
-            
-        Note:
-            This method will not raise ProductNotFoundError if some products
-            don't exist. It will simply return the products that were found.
+            List[Dict[str, Any]]: The product data for each found product.
             
         Raises:
-            StorageConnectionError: If there's an error connecting to storage.
+            ProductNotFoundError: If any of the products are not found.
+            StorageConnectionError: If a connection to the storage cannot be established.
         """
         pass
     
-    @abstractmethod
-    async def update_product(self, product_id: str, product: ProductData) -> bool:
+    @abc.abstractmethod
+    async def update_product(self, product_id: str, product_data: Dict[str, Any]) -> str:
         """
-        Update an existing product.
+        Update a product in the storage.
         
         Args:
             product_id: The ID of the product to update.
-            product: The new product data.
+            product_data: A dictionary containing updated product data.
             
         Returns:
-            bool: True if the update was successful.
+            str: The ID of the updated product.
             
         Raises:
-            ProductNotFoundError: If the product doesn't exist.
-            StorageConnectionError: If there's an error connecting to storage.
+            ProductNotFoundError: If the product is not found.
+            StorageConnectionError: If a connection to the storage cannot be established.
         """
         pass
     
-    @abstractmethod
-    async def update_products(self, products: Dict[str, ProductData]) -> Dict[str, bool]:
+    @abc.abstractmethod
+    async def update_products(self, products: List[Dict[str, Any]]) -> List[str]:
         """
-        Update multiple products in batch.
+        Update multiple products in the storage in a batch operation.
         
         Args:
-            products: Dictionary mapping product IDs to new product data.
+            products: A list of dictionaries containing updated product data with their IDs.
+                     Each dictionary should include a product_id key.
             
         Returns:
-            Dict[str, bool]: Dictionary mapping product IDs to success status.
+            List[str]: The IDs of the updated products.
             
         Raises:
-            StorageConnectionError: If there's an error connecting to storage.
+            ProductNotFoundError: If any of the products are not found.
+            StorageConnectionError: If a connection to the storage cannot be established.
         """
         pass
     
-    @abstractmethod
+    @abc.abstractmethod
     async def delete_product(self, product_id: str) -> bool:
         """
-        Delete a product.
+        Delete a product from the storage.
         
         Args:
             product_id: The ID of the product to delete.
             
         Returns:
-            bool: True if the deletion was successful.
+            bool: True if the product was deleted, False otherwise.
             
         Raises:
-            ProductNotFoundError: If the product doesn't exist.
-            StorageConnectionError: If there's an error connecting to storage.
+            ProductNotFoundError: If the product is not found.
+            StorageConnectionError: If a connection to the storage cannot be established.
         """
         pass
     
-    @abstractmethod
-    async def delete_products(self, product_ids: List[str]) -> Dict[str, bool]:
+    @abc.abstractmethod
+    async def delete_products(self, product_ids: List[str]) -> int:
         """
-        Delete multiple products in batch.
+        Delete multiple products from the storage in a batch operation.
         
         Args:
-            product_ids: List of product IDs to delete.
+            product_ids: A list of product IDs to delete.
             
         Returns:
-            Dict[str, bool]: Dictionary mapping product IDs to success status.
+            int: The number of products deleted.
             
         Raises:
-            StorageConnectionError: If there's an error connecting to storage.
+            ProductNotFoundError: If any of the products are not found.
+            StorageConnectionError: If a connection to the storage cannot be established.
         """
         pass
     
-    @abstractmethod
+    @abc.abstractmethod
     async def list_products(
         self,
         filters: Optional[Dict[str, Any]] = None,
-        limit: Optional[int] = None,
-        offset: Optional[int] = None,
+        page: int = 1,
+        page_size: int = 50,
         sort_by: Optional[str] = None,
-        sort_order: Optional[str] = None
-    ) -> Tuple[List[ProductData], int]:
+        sort_order: str = "asc"
+    ) -> Dict[str, Any]:
         """
-        List products with optional filtering, pagination, and sorting.
+        List products in the storage with optional filtering, pagination and sorting.
         
         Args:
-            filters: Dictionary mapping fields to filter values.
-            limit: Maximum number of products to return.
-            offset: Number of products to skip.
+            filters: Optional dictionary of field:value to filter products.
+            page: Page number (1-indexed).
+            page_size: Number of items per page.
             sort_by: Field to sort by.
-            sort_order: Sort order, "asc" or "desc".
+            sort_order: Sort order, either "asc" or "desc".
             
         Returns:
-            Tuple[List[ProductData], int]: List of products and total count.
+            Dict[str, Any]: Dictionary containing:
+                - items: List of products
+                - total: Total number of products matching the filters
+                - page: Current page number
+                - page_size: Number of items per page
+                - total_pages: Total number of pages
             
         Raises:
-            StorageConnectionError: If there's an error connecting to storage.
+            StorageConnectionError: If a connection to the storage cannot be established.
         """
         pass
