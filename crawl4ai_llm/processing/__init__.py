@@ -1,7 +1,16 @@
 """
-Data cleaning and normalization for extracted product data.
+Processing package for Crawl4AI LLM.
+
+This package contains modules for processing product data, including
+filtering, transformation, and deduplication.
 """
 
-from .data_processor import DataProcessor
+from .processor import ContentProcessor, DataProcessingError
+from .deduplicator import Deduplicator, get_duplicate_groups
 
-__all__ = ["DataProcessor"] 
+__all__ = [
+    "ContentProcessor",
+    "DataProcessingError",
+    "Deduplicator",
+    "get_duplicate_groups",
+]

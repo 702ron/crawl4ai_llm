@@ -5,20 +5,25 @@ This module provides functionality to generate extraction schemas
 from HTML content by analyzing common patterns in e-commerce sites.
 """
 
-import re
+import hashlib
 import json
 import logging
 import os
-from typing import Dict, List, Optional, Set, Any, Union, Tuple
-from bs4 import BeautifulSoup
-import hashlib
+import re
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
-from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
+from bs4 import BeautifulSoup
+from crawl4ai import (AsyncWebCrawler, BrowserConfig, CacheMode,
+                      CrawlerRunConfig)
 from crawl4ai.extraction_strategy import JsonCssExtractionStrategy
 
 from ..config import config
 from ..prompts.product_extraction import SCHEMA_GENERATION_PROMPT
-from .schema_validator import COMMON_PRODUCT_ATTRIBUTES, SchemaValidator, validate_extraction_schema, correct_extraction_schema
+from .schema_validator import (COMMON_PRODUCT_ATTRIBUTES, SchemaValidator,
+                               correct_extraction_schema,
+                               validate_extraction_schema)
+
+from crawl4ai_llm.crawler.base import BaseCrawler
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -26,11 +31,11 @@ logger = logging.getLogger(__name__)
 # Common selectors for product elements
 COMMON_SELECTORS = {
     "title": [
-        "h1", 
-        "[itemprop='name']", 
-        ".product-title", 
-        ".product-name", 
-        ".product-heading"
+        "h1",
+        "[itemprop='name']",
+        ".product-title",
+        ".product-name",
+        ".product-heading",
     ],
     "price": [
         "[itemprop='price']",
@@ -39,7 +44,7 @@ COMMON_SELECTORS = {
         ".product-price",
         ".current-price",
         ".sale-price",
-        "span.amount"
+        "span.amount",
     ],
     "description": [
         "[itemprop='description']",
@@ -47,40 +52,29 @@ COMMON_SELECTORS = {
         ".product-description",
         ".description",
         ".product-details",
-        "#product-description"
+        "#product-description",
     ],
-    "brand": [
-        "[itemprop='brand']",
-        ".brand",
-        ".product-brand",
-        "[data-brand]"
-    ],
+    "brand": ["[itemprop='brand']", ".brand", ".product-brand", "[data-brand]"],
     "image": [
         "[itemprop='image']",
         ".product-image img",
         ".main-image img",
-        "#main-product-image"
+        "#main-product-image",
     ],
     "images": [
         ".product-gallery img",
         ".product-images img",
         ".thumbnail-images img",
-        ".gallery img"
+        ".gallery img",
     ],
-    "sku": [
-        "[itemprop='sku']",
-        "[data-sku]",
-        ".sku",
-        ".product-sku",
-        "#product-sku"
-    ],
+    "sku": ["[itemprop='sku']", "[data-sku]", ".sku", ".product-sku", "#product-sku"],
     "availability": [
         "[itemprop='availability']",
         ".availability",
         ".stock-status",
         ".product-availability",
-        "[data-availability]"
-    ]
+        "[data-availability]",
+    ],
 }
 
 # Keywords likely to be associated with product features
@@ -95,38 +89,45 @@ ATTRIBUTE_KEYWORDS = {
     "availability": ["availability", "stock", "in stock", "out of stock", "inventory"],
     "rating": ["rating", "stars", "score", "reviews"],
     "reviews": ["reviews", "testimonials", "comments", "feedback"],
-    "categories": ["categories", "category", "department", "section"]
+    "categories": ["categories", "category", "department", "section"],
 }
 
 
 class SchemaGenerator:
     """
     Generates extraction schemas from HTML content.
-    
+
     This class analyzes HTML content to generate extraction schemas
     based on common patterns found in e-commerce websites.
     """
-    
-    def __init__(self, cache_dir: Optional[str] = None, validator: Optional[SchemaValidator] = None):
+
+    def __init__(
+        self,
+        validate_schema: bool = True,
+        auto_correct: bool = True,
+        retry_with_fallback: bool = True,
+    ):
         """
         Initialize the schema generator.
-        
+
         Args:
-            cache_dir: Directory for caching generated schemas. If None, uses config value.
-            validator: Schema validator instance. If None, creates a new one.
+            validate_schema: Whether to validate generated schemas
+            auto_correct: Whether to automatically correct invalid schemas
+            retry_with_fallback: Whether to retry with fallback methods if primary generation fails
         """
-        self.cache_dir = cache_dir or os.path.join(config.crawler.cache_dir, "schemas")
-        os.makedirs(self.cache_dir, exist_ok=True)
-        self.validator = validator or SchemaValidator()
-        
+        self.validator = SchemaValidator()
+        self.validate_schema = validate_schema
+        self.auto_correct = auto_correct
+        self.retry_with_fallback = retry_with_fallback
+
     def _get_cache_key(self, url: str, html: str) -> str:
         """
         Generate a cache key for the schema.
-        
+
         Args:
             url: URL of the product page.
             html: HTML content of the page.
-            
+
         Returns:
             str: Cache key for the schema.
         """
@@ -134,23 +135,23 @@ class SchemaGenerator:
         domain = url.split("/")[2]  # Extract domain from URL
         html_hash = hashlib.md5(html.encode()).hexdigest()
         return f"{domain}_{html_hash[:10]}"
-    
+
     def _get_cache_path(self, cache_key: str) -> str:
         """
         Get the file path for a cached schema.
-        
+
         Args:
             cache_key: Cache key for the schema.
-            
+
         Returns:
             str: File path for the cached schema.
         """
-        return os.path.join(self.cache_dir, f"{cache_key}.json")
-    
+        return os.path.join(config.crawler.cache_dir, "schemas", f"{cache_key}.json")
+
     def _cache_schema(self, cache_key: str, schema: Dict[str, Any]) -> None:
         """
         Cache a generated schema.
-        
+
         Args:
             cache_key: Cache key for the schema.
             schema: Generated schema to cache.
@@ -162,14 +163,14 @@ class SchemaGenerator:
             logger.debug(f"Cached schema to {cache_path}")
         except Exception as e:
             logger.error(f"Error caching schema: {str(e)}")
-    
+
     def _get_cached_schema(self, cache_key: str) -> Optional[Dict[str, Any]]:
         """
         Get a cached schema if available.
-        
+
         Args:
             cache_key: Cache key for the schema.
-            
+
         Returns:
             Optional[Dict[str, Any]]: Cached schema if available, None otherwise.
         """
@@ -181,15 +182,17 @@ class SchemaGenerator:
             except Exception as e:
                 logger.error(f"Error loading cached schema: {str(e)}")
         return None
-    
-    def validate_and_correct_schema(self, schema: Dict[str, Any], url: str) -> Tuple[Dict[str, Any], bool, List[str]]:
+
+    def validate_and_correct_schema(
+        self, schema: Dict[str, Any], url: str
+    ) -> Tuple[Dict[str, Any], bool, List[str]]:
         """
         Validate a schema and correct it if necessary.
-        
+
         Args:
             schema: The schema to validate and correct.
             url: The URL for the schema (for logging purposes).
-            
+
         Returns:
             Tuple containing:
                 - Dict[str, Any]: The validated and potentially corrected schema.
@@ -198,38 +201,44 @@ class SchemaGenerator:
         """
         # Validate the schema
         is_valid, errors = self.validator.validate_schema(schema)
-        
+
         if is_valid:
             logger.debug(f"Schema for {url} is valid")
             return schema, False, []
-            
+
         # Schema is invalid, try to correct it
         logger.warning(f"Schema for {url} is invalid: {', '.join(errors)}")
         corrected_schema, corrections = self.validator.correct_schema(schema)
-        
+
         if corrections:
             logger.info(f"Schema for {url} was corrected: {', '.join(corrections)}")
-            
+
             # Validate again to ensure corrections fixed all issues
-            is_valid, remaining_errors = self.validator.validate_schema(corrected_schema)
-            
+            is_valid, remaining_errors = self.validator.validate_schema(
+                corrected_schema
+            )
+
             if not is_valid:
-                logger.warning(f"Corrected schema for {url} still has issues: {', '.join(remaining_errors)}")
+                logger.warning(
+                    f"Corrected schema for {url} still has issues: {', '.join(remaining_errors)}"
+                )
                 return corrected_schema, True, corrections + remaining_errors
-                
+
             return corrected_schema, True, corrections
-            
+
         logger.error(f"Schema for {url} could not be corrected")
         return schema, False, errors
-        
-    def generate_schema_report(self, schema: Dict[str, Any], url: str) -> Dict[str, Any]:
+
+    def generate_schema_report(
+        self, schema: Dict[str, Any], url: str
+    ) -> Dict[str, Any]:
         """
         Generate a report on schema quality.
-        
+
         Args:
             schema: The schema to analyze.
             url: The URL for the schema (included in the report).
-            
+
         Returns:
             Dict[str, Any]: A report with schema statistics and improvement suggestions.
         """
@@ -237,144 +246,232 @@ class SchemaGenerator:
         report["url"] = url
         report["timestamp"] = config.app.get_timestamp()
         return report
-    
-    async def generate_schema(
-        self, 
-        url: str, 
-        html: Optional[str] = None,
-        use_cache: bool = True,
-        provider: Optional[str] = None,
-        api_token: Optional[str] = None,
-        auto_correct: bool = True,
+
+    async def generate_schema_from_url(
+        self, url: str, crawler: Optional[BaseCrawler] = None
+    ) -> Tuple[Dict[str, Any], bool, List[str]]:
+        """
+        Generate a schema for product extraction from a URL.
+
+        Args:
+            url: The URL to generate a schema for
+            crawler: Optional crawler instance to use
+
+        Returns:
+            A tuple of (schema, success flag, error messages)
+        """
+        # Create a crawler if one wasn't provided
+        if crawler is None:
+            crawler = BaseCrawler()
+
+        # Crawl the page
+        try:
+            result = await crawler.crawl(url)
+            if not result.get("success", False):
+                return {}, False, ["Failed to crawl URL"]
+
+            html_content = result.get("content", "")
+            if not html_content:
+                return {}, False, ["No HTML content found"]
+
+            return await self.generate_schema_from_html(html_content)
+        except Exception as e:
+            logger.error(f"Error generating schema from URL: {e}")
+            return {}, False, [f"Error: {str(e)}"]
+
+    async def generate_schema_from_html(
+        self, html_content: str
+    ) -> Tuple[Dict[str, Any], bool, List[str]]:
+        """
+        Generate a schema for product extraction from HTML content.
+
+        Args:
+            html_content: The HTML content to analyze
+
+        Returns:
+            A tuple of (schema, success flag, error messages)
+        """
+        # Generate initial schema using auto schema extractor
+        try:
+            schema = await self._generate_schema_with_auto_extractor(html_content)
+            if not schema:
+                return {}, False, ["Failed to generate schema with auto extractor"]
+
+            # Validate the schema if requested
+            if self.validate_schema:
+                is_valid = self.validator.validate(schema)
+                errors = self.validator.errors
+
+                if not is_valid and self.auto_correct:
+                    schema = self.validator.correct_schema(schema)
+                    is_valid = self.validator.validate(schema)
+                    remaining_errors = self.validator.errors
+                    
+                    return schema, is_valid, remaining_errors
+
+                return schema, is_valid, errors
+
+            return schema, True, []
+        except Exception as e:
+            logger.error(f"Error generating schema from HTML: {e}")
+            return {}, False, [f"Error: {str(e)}"]
+
+    async def _generate_schema_with_auto_extractor(
+        self, html_content: str
     ) -> Dict[str, Any]:
         """
-        Generate an extraction schema for a product page.
-        
+        Generate a schema using BeautifulSoup and pattern matching.
+        This implementation replaces the need for AutoSchemaExtractor.
+
         Args:
-            url: URL of the product page.
-            html: HTML content of the page. If None, will be fetched.
-            use_cache: Whether to use cached schemas.
-            provider: LLM provider to use. If None, uses config value.
-            api_token: API token for LLM provider. If None, uses config value.
-            auto_correct: Whether to automatically correct invalid schemas.
-            
+            html_content: The HTML content to analyze
+
         Returns:
-            Dict[str, Any]: Generated extraction schema.
+            A generated schema
         """
-        # If HTML is not provided, fetch it
-        if html is None:
-            browser_config = BrowserConfig(headless=config.crawler.headless)
-            crawler_config = CrawlerRunConfig(cache_mode=CacheMode.ENABLED)
-            
-            async with AsyncWebCrawler(config=browser_config) as crawler:
-                result = await crawler.arun(url=url, config=crawler_config)
-                html = result.html
-        
-        # Check cache if enabled
-        if use_cache:
-            cache_key = self._get_cache_key(url, html)
-            cached_schema = self._get_cached_schema(cache_key)
-            if cached_schema:
-                logger.info(f"Using cached schema for {url}")
-                # Even for cached schemas, validate and correct if necessary
-                if auto_correct:
-                    validated_schema, was_corrected, _ = self.validate_and_correct_schema(cached_schema, url)
-                    if was_corrected:
-                        logger.info(f"Corrected cached schema for {url}")
-                        self._cache_schema(cache_key, validated_schema)
-                        return validated_schema
-                return cached_schema
-        
-        # Set up LLM provider details
-        provider = provider or f"{config.llm.provider}/{config.llm.model}"
-        api_token = api_token or config.llm.api_key
-        
-        # Create extraction strategy for schema generation
-        logger.info(f"Generating schema for {url} using {provider}")
-        extraction_strategy = JsonCssExtractionStrategy(
-            provider=provider,
-            api_token=api_token
-        )
-        
-        # Generate schema using Crawl4AI
         try:
-            schema = await extraction_strategy.generate_schema(
-                html=html,
-                schema_name="E-commerce Product Data",
-                instruction=SCHEMA_GENERATION_PROMPT,
-                extra_args={
-                    "temperature": config.llm.temperature,
-                    "max_tokens": config.llm.max_tokens,
-                }
-            )
+            # Parse HTML
+            soup = BeautifulSoup(html_content, "html.parser")
             
-            # Validate and correct schema if necessary
-            if auto_correct:
-                schema, was_corrected, _ = self.validate_and_correct_schema(schema, url)
-                
-            # Cache the generated schema
-            if use_cache:
-                cache_key = self._get_cache_key(url, html)
-                self._cache_schema(cache_key, schema)
-                
-            return schema
+            # Initialize schema with empty fields list
+            schema = {"fields": []}
             
-        except Exception as e:
-            logger.error(f"Error generating schema for {url}: {str(e)}")
+            # Check for common product fields using known patterns
+            for field_name, selectors in COMMON_SELECTORS.items():
+                # Try each selector pattern
+                for selector in selectors:
+                    elements = soup.select(selector)
+                    if elements:
+                        # Found a matching element
+                        field = {"name": field_name, "selector": selector}
+                        
+                        # Mark required fields
+                        if field_name in ["title", "price"]:
+                            field["required"] = True
+                            
+                        schema["fields"].append(field)
+                        # Only keep the first successful selector for this field
+                        break
             
-            # In case of error, try to create a basic schema
-            basic_schema = {
-                "fields": [
-                    {
+            # If no fields were found for required elements, try fallback techniques
+            if not any(f.get("name") == "title" for f in schema["fields"]):
+                # Fallback for title: use first H1 tag
+                h1 = soup.find("h1")
+                if h1:
+                    schema["fields"].append({
                         "name": "title",
                         "selector": "h1",
-                        "required": True,
-                        "description": "Product title/name"
-                    },
-                    {
-                        "name": "price.current_price",
-                        "selector": ".price, [data-price], .product-price",
-                        "required": True,
-                        "description": "Current product price"
-                    },
-                    {
-                        "name": "price.currency",
-                        "selector": ".currency",
-                        "description": "Currency code or symbol",
                         "required": True
-                    },
-                    {
-                        "name": "description",
-                        "selector": ".product-description, [itemprop='description']",
-                        "description": "Product description"
-                    },
-                    {
+                    })
+            
+            if not any(f.get("name") == "price" for f in schema["fields"]):
+                # Fallback for price: look for elements with price-related text
+                price_patterns = ["price", "amount", "cost", "$", "€", "£"]
+                for pattern in price_patterns:
+                    for element in soup.find_all(text=re.compile(pattern, re.IGNORECASE)):
+                        parent = element.parent
+                        if parent and parent.name in ["span", "div", "p"]:
+                            selector = f"{parent.name}.{' '.join(parent.get('class', []))}"
+                            if parent.get('id'):
+                                selector = f"#{parent.get('id')}"
+                            schema["fields"].append({
+                                "name": "price",
+                                "selector": selector,
+                                "required": True
+                            })
+                            break
+                    if any(f.get("name") == "price" for f in schema["fields"]):
+                        break
+            
+            # Look for product images
+            images = soup.find_all("img")
+            for img in images:
+                if ("product" in " ".join(img.get("class", [])).lower() or
+                    "product" in img.get("id", "").lower() or
+                    img.get("alt") and "product" in img.get("alt").lower()):
+                    schema["fields"].append({
                         "name": "images",
-                        "selector": ".product-image, [itemprop='image']",
-                        "attribute": "src",
-                        "array": True,
-                        "description": "Product images"
-                    }
-                ]
-            }
+                        "selector": f"img#{img.get('id')}" if img.get('id') else "img.product-image",
+                        "attribute": "src"
+                    })
+                    break
             
-            logger.info(f"Using fallback basic schema for {url}")
+            # Schema name and description
+            schema["name"] = "Product Extraction Schema"
+            schema["description"] = "Automatically generated schema for product extraction"
             
-            # Cache the basic schema if requested
-            if use_cache:
-                cache_key = self._get_cache_key(url, html)
-                self._cache_schema(cache_key, basic_schema)
-                
-            return basic_schema 
+            return schema
+        except Exception as e:
+            logger.error(f"Error using auto schema generator: {e}")
+            return {"fields": []}
+
+    def analyze_schema_quality(self, schema: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Analyze the quality of a schema and generate a report.
+
+        Args:
+            schema: The schema to analyze
+
+        Returns:
+            A report with quality metrics and suggestions
+        """
+        # Validate the schema first
+        is_valid = self.validator.validate(schema)
+        
+        # Generate a report
+        report = self.validator.generate_report()
+        suggestions = {}
+        
+        if not is_valid:
+            suggestions["corrections"] = self.validator.correct_schema(schema)
+            
+        # Add suggestions for improvements even if valid
+        if os.getenv("APP_ENV") != "production":
+            suggestions["improvements"] = self.validator.suggest_improvements(schema)
+            
+        return {
+            "valid": is_valid,
+            "report": report,
+            "suggestions": suggestions
+        }
+
+    async def generate_and_validate(
+        self, url: str, crawler: Optional[BaseCrawler] = None
+    ) -> Dict[str, Any]:
+        """
+        Generate a schema for a URL and validate it, returning detailed results.
+
+        Args:
+            url: The URL to generate a schema for
+            crawler: Optional crawler instance to use
+
+        Returns:
+            Results including the schema, validation status, and suggestions
+        """
+        schema, is_valid, errors = await self.generate_schema_from_url(url, crawler)
+        
+        result = {
+            "url": url,
+            "schema": schema,
+            "valid": is_valid,
+            "errors": errors,
+        }
+        
+        if is_valid:
+            quality_analysis = self.analyze_schema_quality(schema)
+            result["quality_report"] = quality_analysis.get("report", {})
+            result["suggestions"] = quality_analysis.get("suggestions", {})
+        
+        return result
 
 
 def generate_schema_from_html(html_content: str) -> Dict[str, Any]:
     """
     Generate an extraction schema from HTML content.
-    
+
     Args:
         html_content: The HTML content to analyze.
-        
+
     Returns:
         A dictionary containing the generated schema.
     """
@@ -385,18 +482,18 @@ def generate_schema_from_html(html_content: str) -> Dict[str, Any]:
 def validate_and_enhance_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
     """
     Validate and enhance an existing schema, ensuring it has proper structure.
-    
+
     Args:
         schema: The schema to validate and enhance.
-        
+
     Returns:
         The validated and enhanced schema.
     """
     validator = SchemaValidator()
     is_valid, errors = validator.validate(schema)
-    
+
     if not is_valid:
         logger.info(f"Schema needs correction: {errors}")
         schema = validator.correct_schema(schema)
-        
-    return schema 
+
+    return schema

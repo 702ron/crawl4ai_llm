@@ -15,6 +15,13 @@ Focus on extracting:
 7. Product attributes and specifications
 8. Variants if available
 9. Reviews and ratings if available
+10. Additional metadata including:
+   - Shipping information
+   - Warranty details
+   - Product dimensions and weight
+   - Material composition
+   - Seller/manufacturer details
+   - Release or launch date
 
 Identify the most reliable selectors for each element.
 Pay attention to microdata, RDFa, or other structured data present in the page.
@@ -30,6 +37,15 @@ Pay special attention to:
 4. Images (collect all image URLs)
 5. Availability status
 6. Specifications and attributes
+7. Reviews and ratings (reviewer name, rating, review text, date)
+8. Variants (different sizes, colors, etc.)
+9. Supplementary metadata such as:
+   - Shipping information and options
+   - Warranty details
+   - Product dimensions and weight
+   - Material composition
+   - Seller or manufacturer information
+   - Product release date
 
 Look for both visible text and metadata in the HTML.
 Some important information like UPC codes might be hidden in meta tags or data attributes.
@@ -48,6 +64,13 @@ Focus first on finding:
 4. Product images (look for high-resolution images in gallery sections)
 5. Product identifiers like SKU, UPC, EAN, etc. (often near the bottom of the page or in metadata)
 
+Then look for supplementary information:
+6. Reviews and ratings (look for star icons, review text blocks, or review sections)
+7. Product attributes and specifications (often in tables or lists)
+8. Shipping and warranty information (usually near the bottom or in tabs)
+9. Product dimensions, weight, and materials
+10. Release date or product availability information
+
 Be flexible in your approach and look for patterns that are typical in e-commerce pages.
 Return the data strictly formatted according to the provided schema.
-""" 
+"""

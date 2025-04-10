@@ -3,8 +3,9 @@
 Setup script for crawl4ai_llm.
 """
 
-from setuptools import setup, find_packages
 import os
+
+from setuptools import find_packages, setup
 
 # Read the contents of README.md
 with open("README.md", encoding="utf-8") as f:
@@ -12,9 +13,7 @@ with open("README.md", encoding="utf-8") as f:
 
 # Read version from package __init__.py
 about = {}
-with open(
-    os.path.join("crawl4ai_llm", "__init__.py"), encoding="utf-8"
-) as f:
+with open(os.path.join("crawl4ai_llm", "__init__.py"), encoding="utf-8") as f:
     exec(f.read(), globals(), about)
 
 # Read requirements from requirements.txt
@@ -45,6 +44,7 @@ setup(
     entry_points={
         "console_scripts": [
             "crawl4ai-extract=crawl4ai_llm.__main__:main",
+            "crawl4ai-api=crawl4ai_llm.api.cli:main",
         ],
     },
-) 
+)
