@@ -1,277 +1,245 @@
 # Crawl4AI LLM
 
-A powerful e-commerce product extraction library that uses LLM-based techniques to extract structured product data from any e-commerce website.
+A Python library for extracting structured product data from e-commerce websites using Large Language Models (LLMs).
 
 ## Features
 
-- **Flexible Crawling**: Built-in crawler with session management and rate limiting
-- **Content Filtering**: Intelligent filtering of web content using BM25, pruning, or LLM-based strategies
-- **Automated Schema Generation**: Dynamically generates extraction schemas based on website content
-- **LLM-Based Extraction**: Uses large language models to extract structured product data
-- **Configurable Storage**: Support for multiple storage backends with batch operations
-- **Command-Line Interface**: Extract products directly from the command line
-- **Lightweight**: Minimal dependencies, focused on core functionality
+- **🔍 Smart Product Extraction**: Extract product data from any e-commerce website using hybrid extraction techniques
+- **🤖 LLM-Powered**: Leverages LLMs for accurate extraction and schema generation
+- **🏗️ Flexible Extraction Strategies**: Schema-based, LLM-based, or hybrid approaches
+- **🔄 Content Filtering**: Advanced content filtering for targeted extraction
+- **💾 Storage Layer**: Built-in storage system with JSON file storage
+- **🔌 REST API**: Full-featured REST API for integration with other systems
+- **📦 SDK/Client Library**: Python client library for easy integration
+- **⚡ Batch Processing**: Efficient batch extraction and storage operations
+- **🧪 Validation & Cleaning**: Built-in data validation and cleaning pipelines
+- **🎯 Multiple Extraction Methods**: CSS selectors, XPath expressions, and hybrid approaches for precise data extraction
 
 ## Installation
 
 ```bash
-pip install crawl4ai_llm
-```
-
-Or from source:
-
-```bash
-git clone https://github.com/username/crawl4ai_llm.git
-cd crawl4ai_llm
-pip install -e .
+pip install crawl4ai-llm
 ```
 
 ## Quick Start
 
-### Command-Line Usage
-
-Extract product data from an e-commerce URL:
-
-```bash
-python -m crawl4ai_llm "https://example-shop.com/products/product-123" --output product.json
-```
-
-### Python API
-
 ```python
 import asyncio
-from crawl4ai_llm.extraction import ProductExtractor
-from crawl4ai_llm.config import AppConfig, LLMConfig, CrawlerConfig, StorageConfig
+from crawl4ai_llm import extract_product
 
-async def extract_product():
-    # Configure the extractor
-    config = AppConfig(
-        llm=LLMConfig(
-            provider="openai",
-            model_name="gpt-3.5-turbo",
-            api_key="your-api-key"
-        ),
-        crawler=CrawlerConfig(
-            user_agent="Mozilla/5.0",
-            timeout=30,
-            max_retries=3
-        ),
-        storage=StorageConfig(
-            type="json",
-            path="./data",
-            use_uuid=True
-        )
-    )
+async def main():
+    product = await extract_product("https://www.amazon.com/dp/B08F7CJQZ3")
+    print(f"Extracted: {product.title}")
+    print(f"Price: {product.price.value} {product.price.currency}")
+    print(f"Brand: {product.brand}")
 
-    # Create extractor instance
-    extractor = ProductExtractor(config=config)
-
-    # Extract product data
-    product_url = "https://example-shop.com/products/product-123"
-    product_data = await extractor.extract(product_url)
-
-    print(f"Extracted product: {product_data.title}")
-    print(f"Price: {product_data.price.current} {product_data.price.currency}")
-    print(f"Description: {product_data.description[:100]}...")
-
-    # Save to storage
-    product_id = await extractor.storage.save_product(product_data)
-    print(f"Saved product with ID: {product_id}")
-
-if __name__ == "__main__":
-    asyncio.run(extract_product())
-```
-
-## Batch Storage Operations
-
-The library supports batch operations for efficient handling of multiple products:
-
-```python
-import asyncio
-from crawl4ai_llm.storage import get_storage
-from crawl4ai_llm.config import StorageConfig
-
-async def batch_operations_example():
-    # Configure storage
-    storage_config = StorageConfig(
-        type="json",
-        path="./data",
-        use_uuid=True
-    )
-    storage = get_storage(storage_config)
-
-    # Batch save multiple products
-    products = [product1, product2, product3, product4, product5]
-    product_ids = await storage.save_products(products)
-    print(f"Saved {len(product_ids)} products with IDs: {product_ids}")
-
-    # Batch retrieve multiple products
-    products_dict = await storage.get_products(product_ids)
-    print(f"Retrieved {len(products_dict)} products")
-
-    # Batch update multiple products
-    updates = {
-        product_ids[0]: updated_product1,
-        product_ids[1]: updated_product2
-    }
-    update_results = await storage.update_products(updates)
-    print(f"Updated {sum(update_results.values())} products successfully")
-
-    # Batch delete multiple products
-    delete_results = await storage.delete_products(product_ids[2:4])
-    print(f"Deleted {sum(delete_results.values())} products successfully")
-
-    # List remaining products
-    products_list, total_count = await storage.list_products()
-    print(f"Remaining products: {total_count}")
-
-if __name__ == "__main__":
-    asyncio.run(batch_operations_example())
-```
-
-## Content Filtering
-
-The library supports intelligent content filtering to improve extraction accuracy:
-
-```python
-from crawl4ai_llm.crawler import BaseCrawler, ContentFilter
-from crawl4ai_llm.config import LLMConfig
-
-# BM25-based filtering (keyword-based relevance)
-bm25_filter = ContentFilter(
-    filter_type="bm25",
-    query="product details specifications features price",
-    threshold=0.5  # Minimum relevance score
-)
-
-# Pruning-based filtering (structural and semantic analysis)
-pruning_filter = ContentFilter(
-    filter_type="pruning",
-    threshold=0.4  # Minimum content quality score
-)
-
-# LLM-based filtering (high-quality content extraction)
-llm_config = LLMConfig(
-    provider="openai",
-    api_token="your-api-key",
-    model="gpt-3.5-turbo"
-)
-llm_filter = ContentFilter(
-    filter_type="llm",
-    llm_config=llm_config,
-    instruction="Extract the main product information, including name, price, features, and specifications."
-)
-
-# CSS Selector filtering (DOM-based content extraction)
-css_filter = ContentFilter(
-    filter_type="css",
-    selector="#product-details .price",  # CSS selector
-    extract_text=True  # Extract text only (True) or HTML (False)
-)
-
-# XPath filtering (XML path-based content extraction)
-xpath_filter = ContentFilter(
-    filter_type="xpath",
-    selector="//div[@id='product-details']/span[@class='price']",  # XPath expression
-    extract_text=True  # Extract text only (True) or HTML (False)
-)
-
-# Regex filtering (pattern-based content extraction)
-regex_filter = ContentFilter(
-    filter_type="regex",
-    pattern=r"Price: \$(\d+\.\d+)",  # Regular expression pattern
-    replacement=None  # Optional replacement string (returns matches if None)
-)
-
-# Regex with replacement (pattern-based content transformation)
-regex_replace_filter = ContentFilter(
-    filter_type="regex",
-    pattern=r"Price: \$(\d+\.\d+)",  # Regular expression pattern
-    replacement=r"Product costs: $\1"  # Replacement with capture groups
-)
-
-# Use filters with the crawler
-crawler = BaseCrawler(
-    content_filters=[bm25_filter, css_filter]  # Can combine multiple filters
-)
-
-# Crawl with content filtering
-result = await crawler.crawl("https://example-shop.com/products/product-123")
-```
-
-### Filter Type Comparison
-
-| Filter Type | Use Case                                        | Pros                            | Cons                                     |
-| ----------- | ----------------------------------------------- | ------------------------------- | ---------------------------------------- |
-| `bm25`      | Finding relevant text blocks based on keywords  | Fast, works with any content    | Less precise than DOM-based methods      |
-| `pruning`   | Removing boilerplate content                    | Improves signal-to-noise ratio  | May remove some relevant content         |
-| `llm`       | Advanced semantic filtering                     | Highly intelligent extraction   | Slower, requires API calls               |
-| `css`       | Extracting specific elements with CSS selectors | Precise targeting, fast         | Requires knowledge of page structure     |
-| `xpath`     | Extracting specific elements with XPath         | Very flexible element selection | More complex syntax than CSS             |
-| `regex`     | Pattern matching and text transformation        | Works on any text content       | Can be brittle if HTML structure changes |
-
-## Configuration
-
-The library uses Pydantic models for configuration:
-
-```python
-from crawl4ai_llm.config import AppConfig, LLMConfig, CrawlerConfig, StorageConfig
-
-config = AppConfig(
-    llm=LLMConfig(
-        provider="openai",  # Currently supports "openai"
-        model_name="gpt-3.5-turbo",  # Model to use for extraction
-        api_key="your-api-key",
-        temperature=0.2,
-        max_tokens=2000
-    ),
-    crawler=CrawlerConfig(
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        timeout=30,  # Request timeout in seconds
-        max_retries=3,  # Max retry attempts
-        retry_delay=2,  # Delay between retries in seconds
-        rate_limit=1  # Requests per second
-    ),
-    storage=StorageConfig(
-        type="json",  # Currently supports "json"
-        path="./data",  # Storage directory
-        use_uuid=True  # Use UUIDs for product IDs
-    )
-)
-```
-
-You can also load configuration from YAML or JSON:
-
-```bash
-python examples/validate_config.py -c config.yaml
+asyncio.run(main())
 ```
 
 ## Extraction Strategies
 
 The library supports multiple extraction strategies:
 
-- **auto**: Dynamically generates a schema for the website and extracts data
-- **llm**: Uses a direct LLM prompt to extract product data
-- **fallback**: A simplified extraction approach when other methods fail
+- **Schema-based**: Generate and use extraction schemas
+- **LLM-based**: Direct extraction using LLM capabilities
+- **CSS-based**: Extract data using CSS selectors
+- **XPath-based**: Extract data using XPath expressions
+- **Hybrid**: Combine multiple extraction methods with intelligent fallbacks
 
 ```python
-# Use automatic schema generation (default)
-product_data = await extractor.extract(url, strategy="auto")
+from crawl4ai_llm import ProductExtractor, CSSExtractor, XPathExtractor, HybridExtractor
 
-# Use direct LLM extraction
-product_data = await extractor.extract(url, strategy="llm")
+# Schema-based extraction
+product_extractor = ProductExtractor()
+product = await product_extractor.extract(url, strategy="schema")
+
+# CSS selector extraction
+css_extractor = CSSExtractor()
+css_selectors = {
+    "title": {"selector": "h1.product-title", "attribute": "text"},
+    "price": {"selector": ".product-price", "attribute": "text"},
+    "description": {"selector": ".product-description", "attribute": "text"},
+}
+product = await css_extractor.extract_with_css(url, selectors=css_selectors)
+
+# XPath extraction
+xpath_extractor = XPathExtractor()
+xpath_expressions = {
+    "title": {"xpath": "//h1"},
+    "price": {"xpath": "//*[contains(@class, 'price')]"},
+    "description": {"xpath": "//*[contains(@class, 'description')]"},
+}
+product = await xpath_extractor.extract_with_xpath(url, xpath_expressions=xpath_expressions)
+
+# Hybrid extraction (combines CSS, XPath, auto-schema, and LLM)
+hybrid_extractor = HybridExtractor()
+product = await hybrid_extractor.extract_with_hybrid(
+    url,
+    css_selectors=css_selectors,
+    xpath_expressions=xpath_expressions,
+    use_auto_schema=True,
+    use_fallback_llm=True
+)
 ```
 
-## Performance Considerations
+## Storage
 
-- **Batch Operations**: Use batch operations when working with multiple products for better performance
-- **Caching**: The library automatically caches crawl results to avoid redundant requests
-- **Content Filtering**: Use appropriate content filters to reduce the amount of data processed by LLMs
+The library includes a storage layer for product data:
 
-## Contributing
+```python
+from crawl4ai_llm.storage import get_storage
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+# Get the storage instance
+storage = get_storage()
+
+# Save a product
+product_id = await storage.save_product(product_data)
+
+# Get a product
+product = await storage.get_product(product_id)
+
+# Batch operations
+product_ids = await storage.save_products([product1, product2, product3])
+```
+
+## Batch Operations
+
+For efficient processing of multiple products:
+
+```python
+# Batch extraction
+urls = ["https://example.com/product1", "https://example.com/product2"]
+results = await extractor.batch_extract(urls, concurrency=2)
+
+# Batch storage
+storage = get_storage()
+with await storage.transaction():
+    for product in products:
+        await storage.save_product(product)
+```
+
+## Content Filtering
+
+Advanced content filtering for targeted extraction:
+
+```python
+from crawl4ai_llm.extraction.content_filter import CSSFilter, XPathFilter
+
+# CSS selector filtering
+css_filter = CSSFilter(selector="div.product-details")
+product_details = css_filter.apply(html_content)
+
+# XPath filtering
+xpath_filter = XPathFilter(xpath="//div[@class='product-specs']/ul/li")
+specs = xpath_filter.apply(html_content)
+
+# Chain filters
+filtered_content = (
+    CSSFilter(selector="div.product-details")
+    .chain(XPathFilter(xpath="//div[@class='specs']"))
+    .apply(html_content)
+)
+```
+
+## REST API
+
+The library includes a REST API for integration with other systems:
+
+```bash
+# Start the API server
+python -m crawl4ai_llm.api --port 8000
+```
+
+Use the API to extract products:
+
+```bash
+curl -X POST http://localhost:8000/extract \
+    -H "Authorization: Bearer your_api_key" \
+    -H "Content-Type: application/json" \
+    -d '{"url": "https://www.amazon.com/dp/B08F7CJQZ3", "strategy": "auto"}'
+```
+
+## SDK/Client Library
+
+The library includes a Python client for easy integration:
+
+```python
+from crawl4ai_llm.client import Crawl4AIClient, ExtractionRequest
+
+# Asynchronous API
+async def extract_product():
+    client = Crawl4AIClient(api_key="your_api_key")
+
+    request = ExtractionRequest(
+        url="https://www.amazon.com/dp/B08F7CJQZ3",
+        extraction_method="hybrid"
+    )
+
+    result = await client.extract_product(request)
+
+    if result.success:
+        print(f"Title: {result.product.title}")
+        print(f"Price: {result.product.price.current} {result.product.price.currency}")
+
+    await client.close()
+
+# Synchronous API
+def extract_product_sync():
+    client = Crawl4AIClient(api_key="your_api_key")
+
+    request = ExtractionRequest(url="https://www.amazon.com/dp/B08F7CJQZ3")
+    result = client.extract_product_sync(request)
+
+    if result.success:
+        print(f"Title: {result.product.title}")
+
+    client.close_sync()
+```
+
+The SDK provides comprehensive functionality:
+
+- Product extraction (single and batch)
+- Product management (get, update, delete)
+- Search and filtering
+- Data export (JSON, CSV)
+- Schema generation
+
+## Examples
+
+Check the `examples` directory for more usage examples:
+
+- `basic_extraction_example.py`: Simple product extraction
+- `batch_extraction_example.py`: Extract multiple products
+- `storage_example.py`: Working with the storage layer
+- `content_filter_example.py`: Content filtering examples
+- `sdk_client_example.py`: Using the SDK/client library
+- `transaction_example.py`: Using transactions for atomic operations
+
+## Configuration
+
+Configure the library using environment variables or a config file:
+
+```python
+from crawl4ai_llm.config import get_config
+
+config = get_config()
+print(f"Storage type: {config.storage.type}")
+print(f"LLM provider: {config.llm.provider}")
+```
+
+Environment variables:
+
+```bash
+export CRAWL4AI_LLM_PROVIDER=openai
+export CRAWL4AI_OPENAI_API_KEY=your_api_key
+export CRAWL4AI_STORAGE_TYPE=json
+export CRAWL4AI_STORAGE_PATH=/path/to/storage
+```
+
+## Documentation
+
+For detailed documentation, refer to the [docs](docs/) directory.
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
