@@ -31,6 +31,38 @@ class CrawlerConfig(BaseModel):
         default=os.getenv("USER_AGENT", "Crawl4AI E-commerce Extractor/1.0"),
         description="User agent string to use for requests",
     )
+    js_rendering: bool = Field(
+        default=os.getenv("JS_RENDERING", "false").lower() == "true",
+        description="Whether to enable JavaScript rendering for dynamic content",
+    )
+    wait_for_load: int = Field(
+        default=int(os.getenv("WAIT_FOR_LOAD", "3000")),
+        description="Time to wait for page load (in milliseconds) after initial navigation",
+    )
+    wait_for_selector: Optional[str] = Field(
+        default=os.getenv("WAIT_FOR_SELECTOR"),
+        description="Optional CSS selector to wait for before considering page loaded",
+    )
+    wait_for_function: Optional[str] = Field(
+        default=os.getenv("WAIT_FOR_FUNCTION"),
+        description="Optional JavaScript function to evaluate on page to determine when loaded",
+    )
+    max_retries: int = Field(
+        default=int(os.getenv("MAX_RETRIES", "3")),
+        description="Maximum number of retry attempts for failed requests",
+    )
+    retry_delay: float = Field(
+        default=float(os.getenv("RETRY_DELAY", "2.0")),
+        description="Initial delay between retries in seconds",
+    )
+    retry_backoff_factor: float = Field(
+        default=float(os.getenv("RETRY_BACKOFF_FACTOR", "1.5")),
+        description="Multiplication factor for exponential backoff between retries",
+    )
+    retry_jitter: float = Field(
+        default=float(os.getenv("RETRY_JITTER", "0.5")),
+        description="Random jitter factor to add to retry delays (0-1)",
+    )
 
 
 class DatabaseConfig(BaseModel):
@@ -101,6 +133,10 @@ class StorageConfig(BaseModel):
     use_uuid: bool = Field(
         default=os.getenv("STORAGE_USE_UUID", "true").lower() == "true",
         description="Use UUIDs for product IDs (if False, uses SKU or URL hash)",
+    )
+    versioning_enabled: bool = Field(
+        default=os.getenv("STORAGE_VERSIONING", "true").lower() == "true",
+        description="Enable versioning for products (tracks history of changes)",
     )
 
 

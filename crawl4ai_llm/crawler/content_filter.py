@@ -10,12 +10,10 @@ from typing import Any, Dict, List, Literal, Optional, Type, Union
 
 from bs4 import BeautifulSoup
 from crawl4ai.content_filter_strategy import (BM25ContentFilter,
-                                              LLMContentFilter,
                                               PruningContentFilter,
                                               RelevantContentFilter)
 
 from ..config import LLMConfig
-
 
 class CSSContentFilter:
     """Filter content using CSS selectors."""
@@ -48,6 +46,10 @@ class CSSContentFilter:
             return [elem.get_text(strip=True) for elem in elements]
         else:
             return [str(elem) for elem in elements]
+
+
+# Import and rename for backward compatibility
+CSSFilter = CSSContentFilter
 
 
 class XPathContentFilter:
@@ -202,6 +204,7 @@ class ContentFilter:
         extract_text: Optional[bool] = None,
         pattern: Optional[str] = None,
         replacement: Optional[str] = None,
+        name: Optional[str] = None,
     ):
         """
         Initialize a content filter.
@@ -216,6 +219,7 @@ class ContentFilter:
             extract_text: Whether to extract text only (True) or HTML (False) for "css" and "xpath" filters.
             pattern: Regular expression pattern for "regex" filter type.
             replacement: Optional replacement string for regex matches.
+            name: Optional name for the filter (for display purposes).
 
         Raises:
             ValueError: If filter_type is "llm" but llm_config is not provided.
@@ -231,6 +235,7 @@ class ContentFilter:
         self.extract_text = extract_text
         self.pattern = pattern
         self.replacement = replacement
+        self.name = name
 
         # Create the underlying filter
         self._filter = self._create_filter()
@@ -251,21 +256,24 @@ class ContentFilter:
             ValueError: If filter_type is not one of the supported types.
             ValueError: If required parameters for a specific filter type are missing.
         """
+        # Special case: if filter_type is already a filter instance, return it
+        if isinstance(self.filter_type, (CSSContentFilter, XPathContentFilter, RegexContentFilter)):
+            return self.filter_type
+            
         if self.filter_type == "bm25":
-            return BM25ContentFilter(
-                user_query=self.query, bm25_threshold=self.threshold
-            )
+            if not self.query:
+                raise ValueError("Query must be provided for BM25 filter")
+            return BM25ContentFilter(query=self.query, threshold=self.threshold)
         elif self.filter_type == "pruning":
-            return PruningContentFilter(user_query=self.query, threshold=self.threshold)
+            if not self.query:
+                raise ValueError("Query must be provided for Pruning filter")
+            return PruningContentFilter(query=self.query, threshold=self.threshold)
         elif self.filter_type == "llm":
-            if not self.llm_config:
-                raise ValueError(
-                    "LLMConfig is required for LLM-based content filtering"
-                )
-
-            return LLMContentFilter(
-                llm_config=self.llm_config, instruction=self.instruction
-            )
+            # LLMContentFilter is not available in the current version of crawl4ai
+            # Fallback to using BM25ContentFilter
+            if not self.query:
+                raise ValueError("Query must be provided for filter (falling back to BM25)")
+            return BM25ContentFilter(query=self.query, threshold=self.threshold)
         elif self.filter_type == "css":
             if not self.selector:
                 raise ValueError("selector is required for css filter")

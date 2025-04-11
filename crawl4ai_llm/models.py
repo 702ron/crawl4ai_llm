@@ -135,6 +135,14 @@ class ProductData(BaseModel):
     extraction_success: bool = Field(
         True, description="Whether the extraction was successful"
     )
+    
+    # Versioning
+    version: int = Field(
+        1, description="Current version number of the product data"
+    )
+    version_history: Optional[List[Dict[str, Any]]] = Field(
+        None, description="History of previous versions (metadata only, not full content)"
+    )
 
     class Config:
         """Pydantic model configuration."""

@@ -14,6 +14,8 @@ A Python library for extracting structured product data from e-commerce websites
 - **⚡ Batch Processing**: Efficient batch extraction and storage operations
 - **🧪 Validation & Cleaning**: Built-in data validation and cleaning pipelines
 - **🎯 Multiple Extraction Methods**: CSS selectors, XPath expressions, and hybrid approaches for precise data extraction
+- **🌐 JavaScript Rendering**: Support for JavaScript-rendered content using Playwright
+- **🔁 Retry Mechanism**: Robust retry with exponential backoff for handling transient failures
 
 ## Installation
 
@@ -214,6 +216,8 @@ Check the `examples` directory for more usage examples:
 - `content_filter_example.py`: Content filtering examples
 - `sdk_client_example.py`: Using the SDK/client library
 - `transaction_example.py`: Using transactions for atomic operations
+- `js_rendering_example.py`: Demonstrating JavaScript rendering capabilities
+- `retry_mechanism_example.py`: Handling failed requests with retry mechanism
 
 ## Configuration
 
@@ -237,6 +241,18 @@ export CRAWL4AI_STORAGE_PATH=/path/to/storage
 ```
 
 ## Documentation
+
+### Core Components
+
+- **Extractor**: Primary interface for extracting product data
+- **Schema**: Define data extraction format and rules
+- **Storage**: Store extracted data with validation
+- **Content Filter**: Filter content for targeted extraction
+- **Client**: SDK for integration with other systems
+- **REST API**: HTTP interface for the library
+- **Batch Processor**: Batch operations for efficiency
+- **Renderer**: JavaScript rendering for dynamic sites
+- **Retry Handler**: Robust request retry mechanism with backoff
 
 For detailed documentation, refer to the [docs](docs/) directory.
 

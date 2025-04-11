@@ -59,7 +59,9 @@ def get_storage(config: Optional[StorageConfig] = None):
 
     if storage_type == "json":
         _storage_instance = storage_class(
-            storage_dir=config.path, use_uuid=config.use_uuid
+            storage_dir=config.path, 
+            use_uuid=config.use_uuid,
+            versioning_enabled=config.versioning_enabled
         )
     else:
         _storage_instance = storage_class(config.path)

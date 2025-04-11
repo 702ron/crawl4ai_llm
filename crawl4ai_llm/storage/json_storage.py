@@ -6,15 +6,13 @@ Each product is stored in a separate JSON file.
 """
 
 import asyncio
-import glob
 import json
 import logging
-import os
 import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 
 import aiofiles
 import filelock
@@ -35,7 +33,8 @@ class JSONStorage(BaseStorage):
     """
 
     def __init__(
-        self, storage_dir: str, create_if_missing: bool = True, use_uuid: bool = True
+        self, storage_dir: str, create_if_missing: bool = True, use_uuid: bool = True,
+        versioning_enabled: bool = True
     ):
         """
         Initialize the JSON storage.
@@ -44,9 +43,11 @@ class JSONStorage(BaseStorage):
             storage_dir: Directory to store JSON files
             create_if_missing: Create the directory if it doesn't exist
             use_uuid: Use UUIDs as filenames (if False, uses product SKU or URL hash)
+            versioning_enabled: Whether to enable versioning for products
         """
         self.storage_dir = Path(storage_dir)
         self.use_uuid = use_uuid
+        self.versioning_enabled = versioning_enabled
         self._locks = {}
         self._locks_lock = threading.Lock()
 
@@ -66,6 +67,17 @@ class JSONStorage(BaseStorage):
         # Create an index file if it doesn't exist
         self.index_path = self.storage_dir / "index.json"
         self.index_lock_path = self.storage_dir / "index.lock"
+
+        # Create versions directory if versioning is enabled
+        if self.versioning_enabled:
+            self.versions_dir = self.storage_dir / "versions"
+            if not self.versions_dir.exists():
+                try:
+                    self.versions_dir.mkdir(parents=True, exist_ok=True)
+                except Exception as e:
+                    raise StorageConnectionError(
+                        f"Failed to create versions directory: {e}"
+                    )
 
         if not self.index_path.exists():
             try:
@@ -108,12 +120,18 @@ class JSONStorage(BaseStorage):
             return str(uuid.uuid4())
 
         # Try to use SKU or other identifier
-        if product.identifiers and product.identifiers.get("sku"):
-            return f"sku_{product.identifiers['sku']}"
-        elif product.identifiers and product.identifiers.get("upc"):
-            return f"upc_{product.identifiers['upc']}"
-        elif product.identifiers and product.identifiers.get("ean"):
-            return f"ean_{product.identifiers['ean']}"
+        if product.sku:
+            return f"sku_{product.sku}"
+        elif product.upc:
+            return f"upc_{product.upc}"
+        elif product.ean:
+            return f"ean_{product.ean}"
+        elif product.isbn:
+            return f"isbn_{product.isbn}"
+        elif product.mpn:
+            return f"mpn_{product.mpn}"
+        elif product.gtin:
+            return f"gtin_{product.gtin}"
 
         # Fall back to title + brand hash
         import hashlib
@@ -169,7 +187,7 @@ class JSONStorage(BaseStorage):
         try:
             with lock.acquire(timeout=10):  # 10 second timeout
                 with open(self.index_path, "w") as f:
-                    json.dump(index_data, f, indent=2)
+                    json.dump(index_data, f, indent=2, default=str)
         except filelock.Timeout:
             logger.error("Timeout waiting for index lock")
             raise StorageError("Timeout waiting for index lock")
@@ -199,16 +217,22 @@ class JSONStorage(BaseStorage):
         if file_path.exists() and not self.use_uuid:
             raise DuplicateProductError(f"Product with ID {product_id} already exists")
 
-        # Add metadata
-        product_dict = product.dict()
-        product_dict["metadata"] = product_dict.get("metadata", {})
-        product_dict["metadata"]["saved_at"] = datetime.utcnow().isoformat()
-        product_dict["metadata"]["product_id"] = product_id
-
-        # Get lock for the file
+        # Create lock for the file
         lock = self._get_lock(file_path)
 
         try:
+            # Add metadata and prepare for saving
+            product_dict = product.model_dump()
+            metadata = product_dict.get("metadata", {})
+            metadata.update(
+                {
+                    "product_id": product_id,
+                    "created_at": datetime.utcnow().isoformat(),
+                    "updated_at": datetime.utcnow().isoformat(),
+                }
+            )
+            product_dict["metadata"] = metadata
+
             # Save the product
             with lock.acquire(timeout=10):  # 10 second timeout
                 with open(file_path, "w") as f:
@@ -218,21 +242,22 @@ class JSONStorage(BaseStorage):
             index = await self._load_index()
             index[product_id] = {
                 "title": product.title,
-                "url": product.url,
+                "url": str(product.url) if product.url else None,
                 "brand": product.brand,
-                "saved_at": product_dict["metadata"]["saved_at"],
-                "file_path": file_path.name,
+                "created_at": metadata["created_at"],
+                "updated_at": metadata["updated_at"],
+                "version": product.version
             }
             await self._save_index(index)
 
-            logger.info(f"Saved product {product_id} to {file_path}")
+            logger.info(f"Saved product {product_id}")
             return product_id
         except filelock.Timeout:
             logger.error(f"Timeout waiting for file lock: {file_path}")
             raise StorageError(f"Timeout waiting for file lock: {file_path}")
-        except OSError as e:
-            logger.error(f"Failed to save product: {e}")
-            raise StorageError(f"Failed to save product: {e}")
+        except (OSError, json.JSONDecodeError) as e:
+            logger.error(f"Failed to save product {product_id}: {e}")
+            raise StorageError(f"Failed to save product {product_id}: {e}")
 
     async def save_products(self, products: List[ProductData]) -> List[str]:
         """
@@ -267,7 +292,7 @@ class JSONStorage(BaseStorage):
             product_ids.append(product_id)
 
             # Add metadata
-            product_dict = product.dict()
+            product_dict = product.model_dump()
             product_dict["metadata"] = product_dict.get("metadata", {})
             product_dict["metadata"]["saved_at"] = datetime.utcnow().isoformat()
             product_dict["metadata"]["product_id"] = product_id
@@ -353,7 +378,7 @@ class JSONStorage(BaseStorage):
 
         try:
             with lock.acquire(
-                timeout=10, poll_intervall=0.1
+                timeout=10, poll_interval=0.1
             ):  # 10 second timeout, check every 100ms
                 with open(file_path, "r") as f:
                     content = f.read()
@@ -415,8 +440,10 @@ class JSONStorage(BaseStorage):
         """
         Update an existing product in storage.
 
+        If versioning is enabled, this will create a new version of the product.
+
         Args:
-            product_id: The ID of the product to update
+            product_id: The product ID
             product: The updated product data
 
         Returns:
@@ -435,15 +462,39 @@ class JSONStorage(BaseStorage):
         lock = self._get_lock(file_path)
 
         try:
-            # Get existing product to preserve metadata
+            # Get existing product to preserve metadata and handle versioning
             existing_product = await self.get_product(product_id)
-            existing_dict = existing_product.dict()
-
-            # Update with new data
-            product_dict = product.dict()
+            
+            # If versioning is enabled, archive the current version
+            if self.versioning_enabled:
+                await self._archive_current_version(product_id, existing_product)
+                
+                # If the version isn't explicitly set in the new data, increment it
+                if product.version == 1:  # Default version
+                    product.version = existing_product.version + 1
+                    
+                # Update version history
+                if product.version_history is None:
+                    product.version_history = []
+                    
+                # Get history from existing product if available
+                if existing_product.version_history:
+                    product.version_history = existing_product.version_history
+                    
+                # Add metadata about the previous version
+                version_metadata = {
+                    "version": existing_product.version,
+                    "updated_at": datetime.now().isoformat(),
+                    "changes": "Product updated"  # Could be expanded with actual change detection
+                }
+                product.version_history.append(version_metadata)
+            
+            # Preserve existing metadata
+            existing_dict = existing_product.model_dump()
+            product_dict = product.model_dump()
             product_dict["metadata"] = existing_dict.get("metadata", {})
             product_dict["metadata"].update(product_dict.get("metadata", {}))
-            product_dict["metadata"]["updated_at"] = datetime.utcnow().isoformat()
+            product_dict["metadata"]["updated_at"] = datetime.now().isoformat()
             product_dict["metadata"]["product_id"] = product_id
 
             # Save the updated product
@@ -457,14 +508,15 @@ class JSONStorage(BaseStorage):
                 index[product_id].update(
                     {
                         "title": product.title,
-                        "url": product.url,
+                        "url": str(product.url) if product.url else None,
                         "brand": product.brand,
                         "updated_at": product_dict["metadata"]["updated_at"],
+                        "version": product.version
                     }
                 )
                 await self._save_index(index)
 
-            logger.info(f"Updated product {product_id}")
+            logger.info(f"Updated product {product_id} to version {product.version}")
             return True
         except filelock.Timeout:
             logger.error(f"Timeout waiting for file lock: {file_path}")
@@ -509,10 +561,10 @@ class JSONStorage(BaseStorage):
                 try:
                     # Get existing product to preserve metadata
                     existing_product = await self.get_product(product_id)
-                    existing_dict = existing_product.dict()
+                    existing_dict = existing_product.model_dump()
 
                     # Update with new data
-                    product_dict = product.dict()
+                    product_dict = product.model_dump()
                     product_dict["metadata"] = existing_dict.get("metadata", {})
                     product_dict["metadata"].update(product_dict.get("metadata", {}))
                     product_dict["metadata"][
@@ -530,9 +582,10 @@ class JSONStorage(BaseStorage):
                         index[product_id].update(
                             {
                                 "title": product.title,
-                                "url": product.url,
+                                "url": str(product.url) if product.url else None,
                                 "brand": product.brand,
                                 "updated_at": product_dict["metadata"]["updated_at"],
+                                "version": product.version
                             }
                         )
 
@@ -836,3 +889,158 @@ class JSONStorage(BaseStorage):
             return filter_value in metadata_value
         else:
             return metadata_value == filter_value
+
+    def _get_version_dir(self, product_id: str) -> Path:
+        """
+        Get the directory for storing versions of a product.
+
+        Args:
+            product_id: The product ID
+
+        Returns:
+            Path: The directory path for versions
+        """
+        return self.versions_dir / product_id
+
+    def _get_version_file_path(self, product_id: str, version: int) -> Path:
+        """
+        Get the file path for a specific version of a product.
+
+        Args:
+            product_id: The product ID
+            version: The version number
+
+        Returns:
+            Path: The file path for the version
+        """
+        version_dir = self._get_version_dir(product_id)
+        return version_dir / f"v{version}.json"
+
+    async def _archive_current_version(self, product_id: str, product_data: ProductData) -> None:
+        """
+        Archive the current version of a product before updating.
+
+        Args:
+            product_id: The product ID
+            product_data: The current product data to archive
+        """
+        if not self.versioning_enabled:
+            return
+
+        # Create version directory if it doesn't exist
+        version_dir = self._get_version_dir(product_id)
+        if not version_dir.exists():
+            version_dir.mkdir(parents=True, exist_ok=True)
+
+        # Get the current version number
+        current_version = product_data.version
+
+        # Save the current version to the versions directory
+        version_file_path = self._get_version_file_path(product_id, current_version)
+        
+        # Create a lock for the version file
+        lock = self._get_lock(version_file_path)
+        
+        try:
+            with lock.acquire(timeout=10):
+                async with aiofiles.open(version_file_path, "w") as f:
+                    # Convert to dict and serialize
+                    product_dict = product_data.model_dump()
+                    await f.write(json.dumps(product_dict, indent=2))
+        except (OSError, filelock.Timeout) as e:
+            logger.error(f"Failed to archive version {current_version} of product {product_id}: {e}")
+            # Continue with the update even if archiving fails
+
+    async def get_product_version(self, product_id: str, version: int) -> ProductData:
+        """
+        Get a specific version of a product.
+
+        Args:
+            product_id: The product ID
+            version: The version number to retrieve
+
+        Returns:
+            ProductData: The product data for the specified version
+
+        Raises:
+            ProductNotFoundError: If the product or version is not found
+            StorageError: If there's an error retrieving the product
+        """
+        if not self.versioning_enabled:
+            raise StorageError("Versioning is not enabled for this storage instance")
+
+        # Check if the product exists
+        product_file_path = self._get_file_path(product_id)
+        if not product_file_path.exists():
+            raise ProductNotFoundError(f"Product with ID {product_id} not found")
+
+        # Get the current product to check max version
+        current_product = await self.get_product(product_id)
+        if version > current_product.version:
+            raise ProductNotFoundError(f"Version {version} of product {product_id} not found")
+
+        # If requesting the current version, return it
+        if version == current_product.version:
+            return current_product
+
+        # Otherwise, look for the specific version
+        version_file_path = self._get_version_file_path(product_id, version)
+        if not version_file_path.exists():
+            raise ProductNotFoundError(f"Version {version} of product {product_id} not found")
+
+        try:
+            async with aiofiles.open(version_file_path, "r") as f:
+                content = await f.read()
+                product_data = json.loads(content)
+                return ProductData.model_validate(product_data)
+        except (OSError, json.JSONDecodeError) as e:
+            logger.error(f"Failed to read version {version} of product {product_id}: {e}")
+            raise StorageError(f"Failed to read version {version} of product {product_id}: {e}")
+
+    async def list_product_versions(self, product_id: str) -> List[Dict[str, Any]]:
+        """
+        List all available versions of a product.
+
+        Args:
+            product_id: The product ID
+
+        Returns:
+            List[Dict[str, Any]]: List of available versions with metadata
+
+        Raises:
+            ProductNotFoundError: If the product is not found
+        """
+        if not self.versioning_enabled:
+            raise StorageError("Versioning is not enabled for this storage instance")
+
+        # Check if the product exists
+        product_file_path = self._get_file_path(product_id)
+        if not product_file_path.exists():
+            raise ProductNotFoundError(f"Product with ID {product_id} not found")
+
+        # Get the current product to access version history
+        try:
+            current_product = await self.get_product(product_id)
+            
+            # If no version history exists, return just the current version
+            if not current_product.version_history:
+                return [{
+                    "version": current_product.version,
+                    "is_current": True,
+                    "updated_at": current_product.extracted_at or datetime.now().isoformat()
+                }]
+                
+            # Add the current version to the history list
+            versions = current_product.version_history.copy()
+            versions.append({
+                "version": current_product.version,
+                "is_current": True,
+                "updated_at": current_product.extracted_at or datetime.now().isoformat()
+            })
+            
+            # Sort by version number
+            return sorted(versions, key=lambda v: v["version"])
+            
+        except Exception as e:
+            logger.error(f"Failed to list versions for product {product_id}: {e}")
+            raise StorageError(f"Failed to list versions for product {product_id}: {e}")

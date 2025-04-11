@@ -182,6 +182,41 @@ class BaseStorage(abc.ABC):
         """
         pass
 
+    @abc.abstractmethod
+    async def get_product_version(self, product_id: str, version: int) -> ProductData:
+        """
+        Get a specific version of a product.
+
+        Args:
+            product_id: The ID of the product
+            version: The version number to retrieve
+
+        Returns:
+            ProductData object for the specified version
+
+        Raises:
+            ProductNotFoundError: If the product or version is not found
+            StorageConnectionError: If there's an issue connecting to storage
+        """
+        pass
+
+    @abc.abstractmethod
+    async def list_product_versions(self, product_id: str) -> List[Dict[str, Any]]:
+        """
+        List all available versions of a product.
+
+        Args:
+            product_id: The ID of the product
+
+        Returns:
+            List of dictionaries containing version metadata
+
+        Raises:
+            ProductNotFoundError: If the product is not found
+            StorageConnectionError: If there's an issue connecting to storage
+        """
+        pass
+
 
 class StorageError(Exception):
     """Base exception for storage-related errors."""
